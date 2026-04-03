@@ -641,8 +641,11 @@
 
   // ── Bootstrap ───────────────────────────────────────────────────
   init().catch(err => {
-    document.getElementById('igv-container').innerHTML =
-      '<div class="alert alert-danger m-3">Initialization failed: ' + err.message + '</div>';
+    const container = document.getElementById('igv-container');
+    const div = document.createElement('div');
+    div.className = 'alert alert-danger m-3';
+    div.textContent = 'Initialization failed: ' + err.message;
+    container.appendChild(div);
   });
 
 })();

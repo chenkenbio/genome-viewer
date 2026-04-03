@@ -124,7 +124,12 @@ impl From<anyhow::Error> for AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (self.status, self.message).into_response()
+        if self.status.is_server_error() {
+            tracing::error!(message = %self.message, "internal error");
+            (self.status, "internal server error").into_response()
+        } else {
+            (self.status, self.message).into_response()
+        }
     }
 }
 
@@ -817,6 +822,10 @@ fn save_token_to_user_config(token: &str) -> Result<()> {
             .with_context(|| format!("failed to write {}", config_path.display()))?;
         std::io::Write::write_all(&mut file, yaml.as_bytes())?;
     }
+    // Enforce permissions even if the file already existed
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to set permissions on {}", config_path.display()))?;
     Ok(())
 }
 
@@ -837,11 +846,9 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 }
 
 fn generate_token() -> String {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-    let h1 = RandomState::new().build_hasher().finish();
-    let h2 = RandomState::new().build_hasher().finish();
-    format!("{:016x}{:016x}", h1, h2)
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).expect("failed to generate random token");
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 fn display_url(addr: &SocketAddr) -> String {

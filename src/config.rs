@@ -193,14 +193,22 @@ pub fn load_chrom_sizes(source: &str) -> Result<BTreeMap<String, u64>> {
     Ok(chrom_sizes)
 }
 
+/// Expand `~` and environment variables in a path. Used for config file values.
 pub fn expand_path(path: &str) -> Result<PathBuf> {
     let expanded =
         shellexpand::full(path).with_context(|| format!("failed to expand path '{}'", path))?;
     Ok(PathBuf::from(expanded.as_ref()))
 }
 
+/// Expand only `~` (no $ENV vars). Used for user-facing path inputs to avoid info leaks.
+pub fn expand_path_safe(path: &str) -> Result<PathBuf> {
+    let expanded =
+        shellexpand::tilde(path);
+    Ok(PathBuf::from(expanded.as_ref()))
+}
+
 pub fn normalize_local_path(path: &str) -> Result<PathBuf> {
-    let expanded = expand_path(path)?;
+    let expanded = expand_path_safe(path)?;
     let base = if expanded.is_absolute() {
         expanded
     } else {
