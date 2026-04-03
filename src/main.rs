@@ -1,0 +1,924 @@
+mod config;
+mod model;
+mod tracks;
+
+use std::net::SocketAddr;
+use std::path::{Path as FsPath, PathBuf};
+use std::sync::{Arc, RwLock};
+
+use anyhow::{Context, Result, anyhow, bail};
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{StatusCode, header};
+use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::routing::{delete, get, post};
+use axum::{Form, Json, Router, middleware};
+use clap::Parser;
+use tower::ServiceExt;
+use tower_http::services::{ServeDir, ServeFile};
+
+use crate::config::{
+    ResolvedConfig, TrackConfig, TrackKind, build_config, expand_path, is_remote_path,
+    default_chrom_sizes_url, load_input_config, load_user_config, normalize_local_path,
+};
+use crate::model::{
+    AddTrackRequest, ApiConfigResponse, FileBrowserEntry, FileBrowserResponse,
+    ReorderTracksRequest, TrackResponse, UiConfigResponse, WindowFunction,
+};
+use crate::tracks::{
+    TextTrack, build_text_tracks, igvjs_format, infer_track_kind, is_genomic_file,
+    load_text_track, query_bigbed, query_bigwig, query_text_track,
+};
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "genome_viewer",
+    about = "Genome browser server. Launch in any directory to browse genomic tracks."
+)]
+struct Args {
+    /// JSON config file for pre-defined tracks (optional).
+    /// Can be a full config or just `{ "tracks": [...] }`.
+    #[arg(long)]
+    config: Option<String>,
+
+    /// Address to bind the server.
+    #[arg(long, default_value = "127.0.0.1:8080")]
+    bind: String,
+
+    /// Genome name (default: hg38). Ignored when --config provides a genome section.
+    #[arg(long)]
+    genome: Option<String>,
+
+    /// Path to chromosome sizes file. Auto-detected from seedat resources if omitted.
+    #[arg(long)]
+    chrom_sizes: Option<String>,
+
+    /// Access token for authentication. Use without a value to auto-generate.
+    #[arg(long, default_missing_value = "auto", num_args = 0..=1)]
+    token: Option<String>,
+
+    /// Additional directories to allow browsing (repeatable).
+    #[arg(long = "root")]
+    roots: Vec<String>,
+
+    /// Don't include the current directory as an allowed root.
+    #[arg(long)]
+    no_cwd: bool,
+
+    /// Title for the viewer.
+    #[arg(long)]
+    title: Option<String>,
+}
+
+#[derive(Clone)]
+struct AppState {
+    config: Arc<ResolvedConfig>,
+    tracks: Arc<RwLock<std::collections::HashMap<String, TrackConfig>>>,
+    track_order: Arc<RwLock<Vec<String>>>,
+    text_tracks: Arc<RwLock<std::collections::HashMap<String, TextTrack>>>,
+    allowed_roots: Arc<Vec<PathBuf>>,
+    token: Option<String>,
+}
+
+#[derive(Debug)]
+struct AppError {
+    status: StatusCode,
+    message: String,
+}
+
+impl AppError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+        }
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
+    }
+}
+
+impl From<anyhow::Error> for AppError {
+    fn from(value: anyhow::Error) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: value.to_string(),
+        }
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        (self.status, self.message).into_response()
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TrackQuery {
+    chrom: String,
+    start: u64,
+    end: u64,
+    bins: Option<usize>,
+    limit: Option<usize>,
+    window_function: Option<WindowFunction>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct FileListQuery {
+    path: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DataQuery {
+    path: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AuthForm {
+    token: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "genome_viewer=info,tower_http=info".into()),
+        )
+        .init();
+
+    let args = Args::parse();
+    let user_config = load_user_config();
+
+    // Determine genome name: CLI > user config > default
+    let genome_name = args
+        .genome
+        .as_deref()
+        .or(user_config.genome.as_deref())
+        .unwrap_or("hg38")
+        .to_string();
+
+    // Build config from --config file or from CLI/auto-detected defaults
+    let (config, config_roots) = if let Some(ref config_path) = args.config {
+        let input = load_input_config(&expand_path(config_path)?)?;
+        let config_roots = input.ui.allowed_roots.clone();
+
+        let (gname, chrom_sizes_source, default_locus) = if let Some(ref genome) = input.genome {
+            (
+                genome.name.clone(),
+                genome.chrom_sizes.clone(),
+                genome.default_locus.clone(),
+            )
+        } else {
+            let cs = resolve_chrom_sizes(
+                args.chrom_sizes.as_deref(),
+                user_config.chrom_sizes.as_deref(),
+                &genome_name,
+            )?;
+            (genome_name.clone(), cs, None)
+        };
+
+        let title = input
+            .title
+            .or(args.title.clone())
+            .unwrap_or_else(|| "genome_viewer".to_string());
+
+        let resolved = build_config(title, gname, chrom_sizes_source, default_locus, input.tracks)?;
+        (Arc::new(resolved), config_roots)
+    } else {
+        let cs = resolve_chrom_sizes(
+            args.chrom_sizes.as_deref(),
+            user_config.chrom_sizes.as_deref(),
+            &genome_name,
+        )?;
+        let title = args
+            .title
+            .clone()
+            .unwrap_or_else(|| "genome_viewer".to_string());
+        let resolved = build_config(title, genome_name.clone(), cs, None, vec![])?;
+        (Arc::new(resolved), vec![])
+    };
+
+    let text_tracks = Arc::new(RwLock::new(build_text_tracks(&config.raw)?));
+    let tracks = Arc::new(RwLock::new(config.track_map.clone()));
+    let track_order = Arc::new(RwLock::new(
+        config
+            .raw
+            .tracks
+            .iter()
+            .map(|track| track.id.clone())
+            .collect(),
+    ));
+
+    // Merge allowed roots: cwd + CLI --root + user config + JSON config
+    // Canonicalize all roots to resolve symlinks for secure path comparison (SEC-01)
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut push_root = |path: PathBuf| {
+        if let Ok(canonical) = std::fs::canonicalize(&path) {
+            if !roots.contains(&canonical) {
+                roots.push(canonical);
+            }
+        } else {
+            tracing::warn!(path = %path.display(), "allowed root does not exist, skipping");
+        }
+    };
+    if !args.no_cwd {
+        push_root(std::env::current_dir().context("failed to get current directory")?);
+    }
+    for root in &args.roots {
+        push_root(normalize_local_path(root)?);
+    }
+    for root in &user_config.allowed_roots {
+        if let Ok(path) = normalize_local_path(root) {
+            push_root(path);
+        }
+    }
+    for root in &config_roots {
+        if let Ok(path) = normalize_local_path(root) {
+            push_root(path);
+        }
+    }
+    let allowed_roots = Arc::new(roots);
+
+    let token = match args.token {
+        Some(ref value) if value == "auto" => Some(generate_token()),
+        other => other,
+    };
+
+    tracing::info!(
+        genome = %config.raw.genome.name,
+        tracks = config.raw.tracks.len(),
+        roots = allowed_roots.len(),
+        "loaded configuration"
+    );
+    for root in allowed_roots.iter() {
+        tracing::info!(root = %root.display(), "allowed root");
+    }
+    if let Some(ref t) = token {
+        let hint = if t.len() > 6 {
+            format!("{}...", &t[..6])
+        } else {
+            "***".to_string()
+        };
+        tracing::info!(token_hint = %hint, "authentication enabled (full token printed to stderr)");
+        eprintln!("  token: {}", t);
+    }
+
+    let state = AppState {
+        config,
+        tracks,
+        track_order,
+        text_tracks,
+        allowed_roots,
+        token,
+    };
+
+    let static_dir = static_dir_path()?;
+    let static_service =
+        ServeDir::new(&static_dir).not_found_service(ServeFile::new(static_dir.join("index.html")));
+    let app = Router::new()
+        .route("/api/auth", post(auth_handler))
+        .route("/api/config", get(get_config))
+        .route("/api/data", get(serve_data))
+        .route("/api/files", get(list_files))
+        .route("/api/tracks", post(add_track))
+        .route("/api/tracks/reorder", post(reorder_tracks))
+        .route("/api/tracks/{track_id}/query", get(query_track))
+        .route("/api/tracks/{track_id}", delete(remove_track))
+        .fallback_service(static_service)
+        .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(state, auth_middleware));
+
+    let bind_addr: SocketAddr = args
+        .bind
+        .parse()
+        .with_context(|| format!("failed to parse bind address '{}'", args.bind))?;
+    let listener = tokio::net::TcpListener::bind(bind_addr)
+        .await
+        .with_context(|| format!("failed to bind {}", bind_addr))?;
+
+    let addr = listener.local_addr()?;
+    let url = display_url(&addr);
+    tracing::info!(address = %addr, "serving genome_viewer");
+    eprintln!("\n  {} {}\n", "\u{2192}", osc8_hyperlink(&url));
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn get_config(State(state): State<AppState>) -> Json<ApiConfigResponse> {
+    let tracks = current_tracks(&state);
+    Json(ApiConfigResponse {
+        title: state.config.raw.title.clone(),
+        genome_name: state.config.raw.genome.name.clone(),
+        chrom_sizes: state.config.chrom_sizes.clone(),
+        default_locus: state.config.raw.genome.default_locus.clone(),
+        ui: UiConfigResponse {
+            allowed_roots: state
+                .allowed_roots
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+            supports_track_add: !state.allowed_roots.is_empty(),
+        },
+        tracks,
+        todos: vec!["HDF5-backed tracks are planned but not implemented yet.".to_string()],
+    })
+}
+
+async fn list_files(
+    State(state): State<AppState>,
+    Query(query): Query<FileListQuery>,
+) -> Result<Json<FileBrowserResponse>, AppError> {
+    let roots = state
+        .allowed_roots
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+
+    if state.allowed_roots.is_empty() {
+        return Ok(Json(FileBrowserResponse {
+            roots,
+            current_path: None,
+            parent_path: None,
+            entries: Vec::new(),
+        }));
+    }
+
+    let current_path = if let Some(path) = query.path {
+        validate_local_source(&state, &path)?
+    } else {
+        state.allowed_roots[0].clone()
+    };
+
+    if !current_path.is_dir() {
+        return Err(AppError::bad_request(format!(
+            "'{}' is not a directory",
+            current_path.display()
+        )));
+    }
+
+    let mut entries = Vec::new();
+    let read_dir = std::fs::read_dir(&current_path)
+        .with_context(|| format!("failed to read directory '{}'", current_path.display()))?;
+
+    for item in read_dir {
+        let item = item.with_context(|| {
+            format!(
+                "failed to read directory entry under '{}'",
+                current_path.display()
+            )
+        })?;
+        let path = item.path();
+        let file_type = item
+            .file_type()
+            .with_context(|| format!("failed to inspect '{}'", path.display()))?;
+        let is_dir = file_type.is_dir();
+        let name = item.file_name().to_string_lossy().to_string();
+        if !is_dir && !is_genomic_file(&name) {
+            continue;
+        }
+        let (size, format) = if is_dir {
+            (None, None)
+        } else {
+            let meta = item.metadata().ok();
+            let file_size = meta.map(|m| m.len());
+            let fmt = igvjs_format(&name).map(String::from);
+            (file_size, fmt)
+        };
+        entries.push(FileBrowserEntry {
+            name,
+            path: path.display().to_string(),
+            is_dir,
+            size,
+            format,
+        });
+    }
+
+    entries.sort_by(|left, right| match (left.is_dir, right.is_dir) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => left.name.cmp(&right.name),
+    });
+
+    let parent_path = current_path
+        .parent()
+        .filter(|parent| is_within_allowed_roots(&state.allowed_roots, parent))
+        .map(|path| path.display().to_string());
+
+    Ok(Json(FileBrowserResponse {
+        roots,
+        current_path: Some(current_path.display().to_string()),
+        parent_path,
+        entries,
+    }))
+}
+
+async fn serve_data(
+    State(state): State<AppState>,
+    Query(query): Query<DataQuery>,
+    request: Request,
+) -> Result<Response, AppError> {
+    let path = validate_local_source(&state, &query.path)?;
+    if !path.is_file() {
+        return Err(AppError::not_found(format!(
+            "'{}' is not a file",
+            path.display()
+        )));
+    }
+    let response = ServeFile::new(&path)
+        .oneshot(request)
+        .await
+        .map_err(|err| AppError::from(anyhow!("failed to serve file: {}", err)))?;
+    Ok(response.into_response())
+}
+
+async fn add_track(
+    State(state): State<AppState>,
+    Json(request): Json<AddTrackRequest>,
+) -> Result<Json<TrackConfig>, AppError> {
+    let source = request.source.trim().to_string();
+    if source.is_empty() {
+        return Err(AppError::bad_request("source must not be empty"));
+    }
+
+    if !is_remote_path(&source) {
+        validate_local_source(&state, &source)?;
+    }
+
+    let kind = request
+        .kind
+        .or_else(|| infer_track_kind(&source))
+        .ok_or_else(|| {
+            AppError::bad_request("unable to infer track kind from source; specify kind explicitly")
+        })?;
+    let id = unique_track_id(&state, request.id.as_deref().unwrap_or(&source));
+    let name = request
+        .name
+        .unwrap_or_else(|| default_track_name(&source, &kind));
+    let track = TrackConfig {
+        id: id.clone(),
+        name,
+        kind,
+        source: source.clone(),
+        style: request.style,
+    };
+
+    if matches!(track.kind, TrackKind::Bed | TrackKind::Gtf) {
+        let parsed = load_text_track(&track)
+            .with_context(|| format!("failed to preload track '{}'", track.source))?;
+        state
+            .text_tracks
+            .write()
+            .map_err(lock_error)?
+            .insert(id.clone(), parsed);
+    }
+
+    state
+        .tracks
+        .write()
+        .map_err(lock_error)?
+        .insert(id.clone(), track.clone());
+    state.track_order.write().map_err(lock_error)?.push(id);
+
+    Ok(Json(track))
+}
+
+async fn reorder_tracks(
+    State(state): State<AppState>,
+    Json(request): Json<ReorderTracksRequest>,
+) -> Result<Json<Vec<TrackConfig>>, AppError> {
+    if request.track_ids.is_empty() {
+        return Err(AppError::bad_request("track_ids must not be empty"));
+    }
+
+    let existing_ids = state.track_order.read().map_err(lock_error)?.clone();
+    let existing_set = existing_ids
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    let requested_set = request
+        .track_ids
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+
+    if existing_ids.len() != request.track_ids.len() || existing_set != requested_set {
+        return Err(AppError::bad_request(
+            "track_ids must contain every existing track exactly once",
+        ));
+    }
+
+    *state.track_order.write().map_err(lock_error)? = request.track_ids;
+    Ok(Json(current_tracks(&state)))
+}
+
+async fn remove_track(
+    State(state): State<AppState>,
+    Path(track_id): Path<String>,
+) -> Result<Json<Vec<TrackConfig>>, AppError> {
+    let removed_track = state
+        .tracks
+        .write()
+        .map_err(lock_error)?
+        .remove(&track_id)
+        .ok_or_else(|| AppError::not_found(format!("unknown track '{}'", track_id)))?;
+
+    state
+        .track_order
+        .write()
+        .map_err(lock_error)?
+        .retain(|id| id != &track_id);
+
+    if matches!(removed_track.kind, TrackKind::Bed | TrackKind::Gtf) {
+        state
+            .text_tracks
+            .write()
+            .map_err(lock_error)?
+            .remove(&track_id);
+    }
+
+    Ok(Json(current_tracks(&state)))
+}
+
+async fn query_track(
+    State(state): State<AppState>,
+    Path(track_id): Path<String>,
+    Query(query): Query<TrackQuery>,
+) -> Result<Json<TrackResponse>, AppError> {
+    validate_query(&query)?;
+    let track = state
+        .tracks
+        .read()
+        .map_err(lock_error)?
+        .get(&track_id)
+        .cloned()
+        .ok_or_else(|| AppError::not_found(format!("unknown track '{}'", track_id)))?;
+
+    let chrom = query.chrom.clone();
+    let start = query.start;
+    let end = query.end;
+
+    let response = match track.kind {
+        TrackKind::BigWig => {
+            let source = track.source.clone();
+            let bins = query.bins.unwrap_or(800);
+            let window_function = query.window_function.unwrap_or_default();
+            tokio::task::spawn_blocking(move || {
+                query_bigwig(&source, &chrom, start, end, bins, window_function).map(|signal| {
+                    TrackResponse {
+                        track_id,
+                        kind: TrackKind::BigWig,
+                        chrom,
+                        start,
+                        end,
+                        window_function: Some(window_function),
+                        signal: Some(signal),
+                        features: None,
+                    }
+                })
+            })
+            .await
+            .map_err(join_error)?
+            .map_err(AppError::from)?
+        }
+        TrackKind::BigBed => {
+            let source = track.source.clone();
+            let limit = query.limit.unwrap_or(2_000);
+            tokio::task::spawn_blocking(move || {
+                query_bigbed(&source, &chrom, start, end, limit).map(|features| TrackResponse {
+                    track_id,
+                    kind: TrackKind::BigBed,
+                    chrom,
+                    start,
+                    end,
+                    window_function: None,
+                    signal: None,
+                    features: Some(features),
+                })
+            })
+            .await
+            .map_err(join_error)?
+            .map_err(AppError::from)?
+        }
+        TrackKind::Bed | TrackKind::Gtf => {
+            let text_tracks = state.text_tracks.read().map_err(lock_error)?;
+            let text_track = text_tracks.get(&track_id).ok_or_else(|| {
+                AppError::not_found(format!("track '{}' was not preloaded", track_id))
+            })?;
+            let features =
+                query_text_track(text_track, &chrom, start, end, query.limit.unwrap_or(2_000));
+            TrackResponse {
+                track_id,
+                kind: track.kind,
+                chrom,
+                start,
+                end,
+                window_function: None,
+                signal: None,
+                features: Some(features),
+            }
+        }
+    };
+
+    Ok(Json(response))
+}
+
+fn validate_query(query: &TrackQuery) -> Result<(), AppError> {
+    if query.end <= query.start {
+        return Err(AppError::bad_request("end must be greater than start"));
+    }
+    if query.chrom.trim().is_empty() {
+        return Err(AppError::bad_request("chrom must not be empty"));
+    }
+    Ok(())
+}
+
+fn join_error(error: tokio::task::JoinError) -> AppError {
+    AppError::from(anyhow!("background task failed: {}", error))
+}
+
+fn lock_error<T>(_: std::sync::PoisonError<T>) -> AppError {
+    AppError::from(anyhow!("internal state lock was poisoned"))
+}
+
+fn current_tracks(state: &AppState) -> Vec<TrackConfig> {
+    let order = state.track_order.read().expect("track order lock");
+    let tracks = state.tracks.read().expect("tracks lock");
+    order
+        .iter()
+        .filter_map(|track_id| tracks.get(track_id).cloned())
+        .collect()
+}
+
+fn resolve_chrom_sizes(
+    cli: Option<&str>,
+    user_config: Option<&str>,
+    genome: &str,
+) -> Result<String> {
+    if let Some(cs) = cli {
+        return Ok(cs.to_string());
+    }
+    if let Some(cs) = user_config {
+        return Ok(cs.to_string());
+    }
+    // Fallback: fetch from igv.org (known genomes) or UCSC
+    let url = default_chrom_sizes_url(genome);
+    tracing::info!(genome = %genome, url = %url, "fetching chrom sizes from remote");
+    Ok(url)
+}
+
+fn validate_local_source(state: &AppState, source: &str) -> Result<PathBuf, AppError> {
+    let path = normalize_local_path(source).map_err(AppError::from)?;
+    if state.allowed_roots.is_empty() {
+        return Err(AppError::bad_request(
+            "UI loading of server files is disabled because no allowed_roots are configured",
+        ));
+    }
+    // Canonicalize to resolve symlinks — prevents symlink traversal outside allowed roots
+    let canonical = std::fs::canonicalize(&path).map_err(|e| {
+        AppError::bad_request(format!("cannot resolve path '{}': {}", path.display(), e))
+    })?;
+    if !is_within_allowed_roots(&state.allowed_roots, &canonical) {
+        return Err(AppError::bad_request(format!(
+            "path '{}' is outside allowed roots",
+            path.display()
+        )));
+    }
+    Ok(canonical)
+}
+
+fn is_within_allowed_roots(roots: &[PathBuf], path: &FsPath) -> bool {
+    roots.iter().any(|root| path.starts_with(root))
+}
+
+fn unique_track_id(state: &AppState, seed: &str) -> String {
+    let base = slugify(seed);
+    let tracks = state.tracks.read().expect("tracks lock");
+    if !tracks.contains_key(&base) {
+        return base;
+    }
+
+    for index in 2.. {
+        let candidate = format!("{}-{}", base, index);
+        if !tracks.contains_key(&candidate) {
+            return candidate;
+        }
+    }
+
+    unreachable!("integer sequence should produce a unique track id")
+}
+
+fn slugify(seed: &str) -> String {
+    let file_name = FsPath::new(seed)
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| seed.to_string());
+    let mut slug = String::new();
+    for character in file_name.chars() {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character.to_ascii_lowercase());
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let trimmed = slug.trim_matches('-');
+    if trimmed.is_empty() {
+        "track".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn default_track_name(source: &str, kind: &TrackKind) -> String {
+    FsPath::new(source)
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| format!("{:?}", kind))
+}
+
+fn static_dir_path() -> Result<PathBuf> {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let path = manifest_dir.join("static");
+    if !path.exists() {
+        bail!("static directory '{}' does not exist", path.display());
+    }
+    Ok(path)
+}
+
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    if a.len() != b.len() {
+        return false;
+    }
+    a.as_bytes().ct_eq(b.as_bytes()).into()
+}
+
+fn generate_token() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let h1 = RandomState::new().build_hasher().finish();
+    let h2 = RandomState::new().build_hasher().finish();
+    format!("{:016x}{:016x}", h1, h2)
+}
+
+fn display_url(addr: &SocketAddr) -> String {
+    use std::net::IpAddr;
+    let host = match addr.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => "localhost",
+        IpAddr::V6(ip) if ip.is_unspecified() => "localhost",
+        ref ip => return format!("http://{}:{}/", ip, addr.port()),
+    };
+    format!("http://{}:{}/", host, addr.port())
+}
+
+fn osc8_hyperlink(url: &str) -> String {
+    format!("\x1b]8;;{url}\x1b\\{url}\x1b]8;;\x1b\\")
+}
+
+async fn auth_middleware(
+    State(state): State<AppState>,
+    request: Request,
+    next: middleware::Next,
+) -> Response {
+    let Some(ref expected) = state.token else {
+        return next.run(request).await;
+    };
+
+    // Allow the login endpoint through
+    if request.uri().path() == "/api/auth" {
+        return next.run(request).await;
+    }
+
+    // Check cookie
+    if let Some(cookie_header) = request.headers().get(header::COOKIE) {
+        if let Ok(cookies) = cookie_header.to_str() {
+            for cookie in cookies.split(';') {
+                if let Some(value) = cookie.trim().strip_prefix("genome_viewer_token=") {
+                    if constant_time_eq(value, expected) {
+                        return next.run(request).await;
+                    }
+                }
+            }
+        }
+    }
+
+    // Check Authorization: Bearer header
+    if let Some(auth_header) = request.headers().get(header::AUTHORIZATION) {
+        if let Ok(auth_str) = auth_header.to_str() {
+            if let Some(bearer) = auth_str.strip_prefix("Bearer ") {
+                if constant_time_eq(bearer, expected) {
+                    return next.run(request).await;
+                }
+            }
+        }
+    }
+
+    (StatusCode::UNAUTHORIZED, Html(LOGIN_PAGE)).into_response()
+}
+
+async fn auth_handler(
+    State(state): State<AppState>,
+    Form(form): Form<AuthForm>,
+) -> Response {
+    let Some(ref expected) = state.token else {
+        return Redirect::to("/").into_response();
+    };
+
+    if constant_time_eq(&form.token, expected) {
+        let cookie = format!(
+            "genome_viewer_token={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400",
+            expected
+        );
+        let mut response = Redirect::to("/").into_response();
+        response
+            .headers_mut()
+            .insert(header::SET_COOKIE, cookie.parse().expect("valid cookie"));
+        response
+    } else {
+        (StatusCode::UNAUTHORIZED, Html(LOGIN_PAGE_ERROR)).into_response()
+    }
+}
+
+const LOGIN_PAGE: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>genome_viewer - Login</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;600&display=swap">
+  <style>body{font-family:'Open Sans',sans-serif;}</style>
+</head>
+<body class="bg-light">
+  <div class="container" style="max-width:400px;margin-top:120px;">
+    <div class="card shadow-sm">
+      <div class="card-body">
+        <h5 class="card-title text-center mb-3">genome_viewer</h5>
+        <form method="POST" action="/api/auth">
+          <div class="mb-3">
+            <label class="form-label">Access Token</label>
+            <input type="password" class="form-control" name="token" required autofocus>
+          </div>
+          <button type="submit" class="btn btn-primary w-100">Login</button>
+        </form>
+      </div>
+    </div>
+  </div>
+</body>
+</html>"#;
+
+const LOGIN_PAGE_ERROR: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>genome_viewer - Login</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;600&display=swap">
+  <style>body{font-family:'Open Sans',sans-serif;}</style>
+</head>
+<body class="bg-light">
+  <div class="container" style="max-width:400px;margin-top:120px;">
+    <div class="card shadow-sm">
+      <div class="card-body">
+        <h5 class="card-title text-center mb-3">genome_viewer</h5>
+        <div class="alert alert-danger">Invalid token. Please try again.</div>
+        <form method="POST" action="/api/auth">
+          <div class="mb-3">
+            <label class="form-label">Access Token</label>
+            <input type="password" class="form-control" name="token" required autofocus>
+          </div>
+          <button type="submit" class="btn btn-primary w-100">Login</button>
+        </form>
+      </div>
+    </div>
+  </div>
+</body>
+</html>"#;
+
+#[cfg(test)]
+mod tests {
+    use super::{is_within_allowed_roots, slugify};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn slugify_uses_safe_ascii_ids() {
+        assert_eq!(slugify("/tmp/My Track.bigWig"), "my-track-bigwig");
+    }
+
+    #[test]
+    fn path_must_stay_inside_allowed_roots() {
+        let roots = vec![PathBuf::from("/data/tracks")];
+        assert!(is_within_allowed_roots(
+            &roots,
+            Path::new("/data/tracks/a.bed")
+        ));
+        assert!(!is_within_allowed_roots(
+            &roots,
+            Path::new("/data/other/a.bed")
+        ));
+    }
+}

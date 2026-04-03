@@ -1,0 +1,10 @@
+chr1	demo	gene	155184101	155193900	.	+	.	gene_id "GENE_A"; gene_name "GENE_A";
+chr1	demo	transcript	155184101	155193900	.	+	.	gene_id "GENE_A"; transcript_id "GENE_A-201"; gene_name "GENE_A";
+chr1	demo	exon	155184101	155184500	.	+	.	gene_id "GENE_A"; transcript_id "GENE_A-201"; gene_name "GENE_A";
+chr1	demo	exon	155186101	155186700	.	+	.	gene_id "GENE_A"; transcript_id "GENE_A-201"; gene_name "GENE_A";
+chr1	demo	exon	155191501	155193900	.	+	.	gene_id "GENE_A"; transcript_id "GENE_A-201"; gene_name "GENE_A";
+chr1	demo	gene	155185500	155190500	.	-	.	gene_id "GENE_B"; gene_name "GENE_B";
+chr1	demo	transcript	155185500	155190500	.	-	.	gene_id "GENE_B"; transcript_id "GENE_B-201"; gene_name "GENE_B";
+chr1	demo	exon	155185500	155186000	.	-	.	gene_id "GENE_B"; transcript_id "GENE_B-201"; gene_name "GENE_B";
+chr1	demo	exon	155188001	155188800	.	-	.	gene_id "GENE_B"; transcript_id "GENE_B-201"; gene_name "GENE_B";
+chr1	demo	exon	155189500	155190500	.	-	.	gene_id "GENE_B"; transcript_id "GENE_B-201"; gene_name "GENE_B";

@@ -1,0 +1,59 @@
+{
+  "title": "genome_viewer",
+  "genome": {
+    "name": "hg38",
+    "chrom_sizes": "../igv/genomes/sizes/hg38.chrom.sizes",
+    "default_locus": {
+      "chrom": "chr1",
+      "start": 155184000,
+      "end": 155194000
+    }
+  },
+  "ui": {
+    "allowed_roots": [
+      "./examples"
+    ]
+  },
+  "tracks": [
+    {
+      "id": "signal",
+      "name": "Edit Me: Remote BigWig Signal",
+      "kind": "bigwig",
+      "source": "https://example.org/signal.bigWig",
+      "style": {
+        "color": "#146356",
+        "height": 140
+      }
+    },
+    {
+      "id": "peaks",
+      "name": "Edit Me: Remote BigBed Peaks",
+      "kind": "bigbed",
+      "source": "https://example.org/peaks.bigBed",
+      "style": {
+        "color": "#9c4f2f",
+        "height": 200
+      }
+    },
+    {
+      "id": "regions",
+      "name": "Demo BED Regions",
+      "kind": "bed",
+      "source": "examples/demo.bed",
+      "style": {
+        "color": "#9c4f2f",
+        "height": 180
+      }
+    },
+    {
+      "id": "genes",
+      "name": "Demo GTF Genes",
+      "kind": "gtf",
+      "source": "examples/demo.gtf",
+      "style": {
+        "color": "#4d6175",
+        "height": 220
+      }
+    }
+  ]
+}

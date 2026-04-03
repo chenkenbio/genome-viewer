@@ -1,0 +1,190 @@
+# genome viewer
+
+A single-binary Rust web server for browsing genomic tracks via [igv.js](https://github.com/igvteam/igv.js). Launch it in any directory and start viewing BigWig, BigBed, BED, and GTF files in your browser -- no configuration required.
+
+## Why genome viewer?
+
+[igv-webapp](https://github.com/igvteam/igv-webapp) is the official IGV web application. It works well for public data and quick browsing, but it is a pure client-side app -- the browser fetches and decodes binary genomic files directly, requires CORS-enabled data sources, and has no awareness of your server's filesystem. `genome_viewer` takes a different approach:
+
+- **Zero-config, single binary.** No Java, no Node.js, no web server configuration. Drop the binary on any machine and run it.
+- **Server-side track queries.** BigWig and BigBed files are queried on the server with configurable binning and window functions (mean/min/max/count/density). The browser receives lightweight JSON instead of decoding binary formats itself.
+- **Built-in file browser.** Browse directories on the server and add tracks at runtime. No need to pre-configure every file path or set up CORS.
+- **Layered configuration.** Persistent user defaults in YAML, optional JSON track configs, CLI flags, and automatic chrom sizes fetching from igv.org/UCSC -- all merged in a well-defined order.
+- **Designed for bioinformatics workstations.** Run it on your lab server or HPC login node, open the URL on your laptop. No cloud deployment needed.
+- **Lightweight.** Single Rust binary with minimal dependencies. No JVM, no runtime interpreter.
+
+## Quick start
+
+```bash
+genome_viewer                          # browse current dir, hg38 genome
+genome_viewer --genome mm10            # different genome
+genome_viewer --root ~/data/tracks     # add extra browsable directory
+genome_viewer --config tracks.json     # pre-defined tracks
+genome_viewer --bind 0.0.0.0:9000     # listen on all interfaces
+genome_viewer --token                  # enable auth with auto-generated token
+```
+
+By default, the server binds to `127.0.0.1:8080`, uses the `hg38` genome, and exposes the current working directory as a browsable root. Open the printed URL in your browser to get an igv.js interface with a server-side file browser.
+
+## Installation
+
+```bash
+# From the repo
+cargo build --release
+# Binary at target/release/genome_viewer
+
+# Or install directly
+cargo install --path .
+```
+
+Requires Rust edition 2024.
+
+## CLI options
+
+| Flag | Description |
+|------|-------------|
+| `--config <path>` | JSON config file for pre-defined tracks. Accepts full config or tracks-only format. |
+| `--genome <name>` | Genome name (default: `hg38`). |
+| `--chrom-sizes <path>` | Path or URL to chromosome sizes file. Fetched from igv.org/UCSC if omitted. |
+| `--bind <addr>` | Address to bind (default: `127.0.0.1:8080`). |
+| `--token [value]` | Enable authentication. Omit the value to auto-generate a token. |
+| `--root <path>` | Additional browsable directory (repeatable). |
+| `--no-cwd` | Don't include the current directory as a browsable root. |
+| `--title <text>` | Title shown in the viewer. |
+
+## Configuration
+
+### User config (optional)
+
+Persistent defaults in `~/.config/genomic_viewer/config.yaml`:
+
+```yaml
+genome: hg38
+chrom_sizes: ~/db/gencode/GRCh38/GRCh38.primary_assembly.genome.fa.chromsize
+allowed_roots:
+  - ~/data/tracks
+  - /shared/genomics
+```
+
+### JSON config file (optional)
+
+Tracks-only format -- genome comes from CLI or user config:
+
+```json
+{
+  "tracks": [
+    {
+      "id": "signal",
+      "name": "My Signal",
+      "kind": "bigwig",
+      "source": "/path/to/file.bw"
+    }
+  ]
+}
+```
+
+Full format:
+
+```json
+{
+  "title": "My Viewer",
+  "genome": {
+    "name": "hg38",
+    "chrom_sizes": "/path/to/hg38.chrom.sizes"
+  },
+  "tracks": [
+    {
+      "id": "peaks",
+      "name": "CTCF Peaks",
+      "kind": "bed",
+      "source": "/path/to/peaks.bed",
+      "style": { "color": "#2196F3", "height": 50 }
+    }
+  ]
+}
+```
+
+### Config resolution order
+
+1. CLI args (`--genome`, `--chrom-sizes`, `--root`, `--title`)
+2. JSON config file (`--config`)
+3. User YAML defaults (`~/.config/genomic_viewer/config.yaml`)
+4. Remote fetch (igv.org for known genomes, UCSC for others)
+5. Built-in defaults (`genome=hg38`, `title=genome_viewer`)
+
+Allowed roots are **merged** from all sources. The current directory is always included unless `--no-cwd`.
+
+## Supported formats
+
+### Server-side track querying
+
+These formats are queried server-side and returned as JSON to the frontend:
+
+| Format | Extensions | Query mode |
+|--------|-----------|------------|
+| BigWig | `.bw`, `.bigwig` | On-demand, binned with configurable window functions (mean/min/max/count/density) |
+| BigBed | `.bb`, `.bigbed` | On-demand via indexed range requests |
+| BED | `.bed`, `.bed.gz` | Preloaded into memory at startup, binary-searched at query time |
+| GTF | `.gtf`, `.gtf.gz` | Preloaded into memory at startup (1-based to 0-based coordinate conversion) |
+
+Both local files and remote URLs (`http://`, `https://`) are supported as track sources.
+
+### File browser
+
+The built-in file browser also shows these igv.js-compatible formats for direct loading (served as raw files to igv.js):
+
+BAM, CRAM, VCF, GFF, GFF3, WIG, BedGraph, SEG (plus their index files: `.bai`, `.crai`, `.tbi`, `.csi`, `.idx`).
+
+## API endpoints
+
+All endpoints are under `/api/`:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/config` | Full viewer config including chrom sizes |
+| `GET` | `/api/tracks/{id}/query?chrom=&start=&end=&bins=&window_function=` | Query track data |
+| `POST` | `/api/tracks` | Add a track at runtime |
+| `DELETE` | `/api/tracks/{id}` | Remove a track |
+| `POST` | `/api/tracks/reorder` | Reorder tracks |
+| `GET` | `/api/files?path=` | Browse server files (restricted to allowed roots) |
+| `GET` | `/api/data?path=` | Serve a raw file (restricted to allowed roots) |
+| `POST` | `/api/auth` | Token login |
+
+### Query parameters for track queries
+
+- `chrom` (required) -- chromosome name
+- `start`, `end` (required) -- 0-based coordinates
+- `bins` (optional, default 800) -- number of bins for BigWig signal
+- `limit` (optional, default 2000) -- max features for BED/BigBed/GTF
+- `window_function` (optional, default `mean`) -- one of `mean`, `min`, `max`, `count`, `density`, `none`
+
+## Authentication
+
+Authentication is optional. When enabled, the server requires a token via cookie or `Authorization: Bearer` header.
+
+```bash
+genome_viewer --token                  # auto-generate a random token (printed to stderr)
+genome_viewer --token MY_SECRET        # use a specific token
+```
+
+Unauthenticated requests are redirected to a login page. The token cookie (`genome_viewer_token`) is valid for 24 hours.
+
+## Chromosome sizes resolution
+
+Chromosome sizes are resolved in this order:
+
+1. `--chrom-sizes` CLI flag (local path or URL)
+2. `chrom_sizes` in `~/.config/genomic_viewer/config.yaml`
+3. `genome` section in the JSON config file
+4. Auto-fetch from igv.org (for well-known genomes like hg38, mm10, etc.) or UCSC (`hgdownload.cse.ucsc.edu`)
+
+For common genomes (hg38, hg19, mm10, etc.), no configuration is needed -- chrom sizes are fetched automatically at startup.
+
+## Logging
+
+Uses `tracing` with env-filter:
+
+```bash
+RUST_LOG=genome_viewer=debug genome_viewer
+RUST_LOG=genome_viewer=debug,tower_http=debug genome_viewer    # include HTTP request logs
+```
