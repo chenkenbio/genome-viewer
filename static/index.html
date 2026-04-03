@@ -248,12 +248,42 @@
   let currentGenome = 'hg38';
   let serverConfig = null;
 
+  // Wrapper for fetch that redirects to login on 401
+  async function apiFetch(url, options) {
+    const resp = await fetch(url, { credentials: 'same-origin', ...options });
+    if (resp.status === 401) {
+      saveSession();
+      window.location.reload();
+      throw new Error('Authentication required');
+    }
+    return resp;
+  }
+
+  // ── Session persistence ────────────────────────────────────────
+  function saveSession() {
+    if (!browser) return;
+    try {
+      sessionStorage.setItem('gv_session', JSON.stringify(browser.toJSON()));
+    } catch (_) {}
+  }
+
+  function popSavedSession() {
+    try {
+      const json = sessionStorage.getItem('gv_session');
+      if (json) {
+        sessionStorage.removeItem('gv_session');
+        return JSON.parse(json);
+      }
+    } catch (_) {}
+    return null;
+  }
+
   // ── Initialization ──────────────────────────────────────────────
 
   async function init() {
     // Fetch server config to get allowed_roots and initial genome
     try {
-      const resp = await fetch('/api/config');
+      const resp = await apiFetch('/api/config');
       if (resp.ok) {
         serverConfig = await resp.json();
       }
@@ -261,16 +291,25 @@
       // Server config is optional — igv.js can work standalone
     }
 
-    await createBrowser(currentGenome);
+    // Restore previous session if available (survives refresh / re-auth)
+    const saved = popSavedSession();
+    if (saved) {
+      await createBrowser(null, saved);
+    } else {
+      await createBrowser(currentGenome);
+    }
     setupMenuHandlers();
     setupKeyboardShortcuts();
+
+    // Auto-save session before page unload (F5, tab close, etc.)
+    window.addEventListener('beforeunload', saveSession);
   }
 
-  async function createBrowser(genome) {
+  async function createBrowser(genome, sessionOptions) {
     const container = document.getElementById('igv-container');
     container.innerHTML = '';
 
-    const options = {
+    const options = sessionOptions || {
       genome: genome,
       showNavigation: true,
       showRuler: true,
@@ -279,8 +318,8 @@
     };
 
     browser = await igv.createBrowser(container, options);
-    currentGenome = genome;
-    document.getElementById('genomeLabel').textContent = genome;
+    currentGenome = options.genome || genome || currentGenome;
+    document.getElementById('genomeLabel').textContent = currentGenome;
   }
 
   // ── Genome switching ────────────────────────────────────────────
@@ -364,7 +403,7 @@
 
     try {
       const query = path ? '?path=' + encodeURIComponent(path) : '';
-      const resp = await fetch('/api/files' + query);
+      const resp = await apiFetch('/api/files' + query);
       if (!resp.ok) throw new Error(await resp.text());
       const data = await resp.json();
 

@@ -78,19 +78,20 @@ pub struct InputConfig {
     pub tracks: Vec<TrackConfig>,
 }
 
-/// User-level defaults from `~/.config/genomic_viewer/config.yaml`
+/// User-level defaults from `~/.config/genome_viewer/config.yaml`
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct UserConfig {
     pub genome: Option<String>,
     pub chrom_sizes: Option<String>,
+    pub token: Option<String>,
     #[serde(default)]
     pub allowed_roots: Vec<String>,
 }
 
-/// Load user config from `~/.config/genomic_viewer/config.yaml`.
+/// Load user config from `~/.config/genome_viewer/config.yaml`.
 /// Never fails — returns defaults if the file is missing or invalid.
 pub fn load_user_config() -> UserConfig {
-    let config_path = match expand_path("~/.config/genomic_viewer/config.yaml") {
+    let config_path = match expand_path("~/.config/genome_viewer/config.yaml") {
         Ok(p) => p,
         Err(_) => return UserConfig::default(),
     };
@@ -115,18 +116,9 @@ pub fn load_user_config() -> UserConfig {
     }
 }
 
-/// Return the default chrom sizes URL for a genome assembly.
-/// Uses igv.org for well-known genomes, falls back to UCSC for others.
+/// Return the UCSC-hosted chrom sizes URL for a genome assembly.
 pub fn default_chrom_sizes_url(genome: &str) -> String {
-    let igv_known = [
-        "hg38", "hg19", "hg18", "mm39", "mm10", "mm9", "dm6", "dm3", "rn7", "rn6", "ce11",
-        "sacCer3", "danRer11", "danRer10", "galGal6", "bosTau9", "canFam3", "canFam6",
-    ];
-    if igv_known.contains(&genome) {
-        format!("https://s3.amazonaws.com/igv.org.genomes/{genome}/{genome}.chrom.sizes")
-    } else {
-        format!("https://hgdownload.cse.ucsc.edu/goldenpath/{genome}/bigZips/{genome}.chrom.sizes")
-    }
+    format!("https://hgdownload.cse.ucsc.edu/goldenpath/{genome}/bigZips/{genome}.chrom.sizes")
 }
 
 /// Load a JSON config file (supports both full and tracks-only format).
