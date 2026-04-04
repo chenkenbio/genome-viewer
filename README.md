@@ -1,84 +1,116 @@
-# genome viewer
+# genome_viewer
 
-A single-binary Rust web server for browsing genomic tracks via [igv.js](https://github.com/igvteam/igv.js). Launch it in any directory and start viewing BigWig, BigBed, BED, and GTF files in your browser -- no configuration required.
+`genome_viewer` is a single-binary Rust web server for browsing genomic tracks in the browser with [igv.js](https://github.com/igvteam/igv.js). It is built for the common bioinformatics case where the data lives on a workstation, lab server, or shared filesystem and you want a browser UI without setting up a separate web stack.
 
-## Why genome viewer?
+It serves a small embedded frontend, queries BigWig and BigBed server-side, preloads BED and GTF text tracks, and exposes a constrained file browser for loading local tracks at runtime.
 
-[igv-webapp](https://github.com/igvteam/igv-webapp) is the official IGV web application. It works well for public data and quick browsing, but it is a pure client-side app -- the browser fetches and decodes binary genomic files directly, requires CORS-enabled data sources, and has no awareness of your server's filesystem. `genome_viewer` takes a different approach:
+## Why this exists
 
-- **Zero-config, single binary.** No Java, no Node.js, no web server configuration. Drop the binary on any machine and run it.
-- **Server-side track queries.** BigWig and BigBed files are queried on the server with configurable binning and window functions (mean/min/max/count/density). The browser receives lightweight JSON instead of decoding binary formats itself.
-- **Built-in file browser.** Browse directories on the server and add tracks at runtime. No need to pre-configure every file path or set up CORS.
-- **Layered configuration.** Persistent user defaults in YAML, optional JSON track configs, CLI flags, and automatic chrom sizes fetching from UCSC -- all merged in a well-defined order.
-- **Designed for bioinformatics workstations.** Run it on your lab server or HPC login node, open the URL on your laptop. No cloud deployment needed.
-- **Lightweight.** Single Rust binary with minimal dependencies. No JVM, no runtime interpreter. The frontend is embedded directly in the binary — no external files needed.
-- **Publication-ready figure export.** Generate journal-quality SVG/PNG figures directly from the browser. Configurable layout dimensions (mm), fonts, per-track colors, scale bars, and high-DPI PNG export.
+[igv-webapp](https://github.com/igvteam/igv-webapp) is useful for public data and CORS-friendly URLs, but it is still a client-side web app. That means the browser needs direct access to the data source and has no notion of your server filesystem.
+
+`genome_viewer` takes a different approach:
+
+- Single binary, no Node.js, no Java, no separate static asset deployment.
+- Zero-config startup for common genomes such as `hg38` and `mm10`.
+- Server-side BigWig/BigBed range queries, so the browser receives compact JSON instead of parsing binary formats itself.
+- Built-in file browser for loading tracks from allowed local directories.
+- Token authentication enabled by default.
+- Publication-oriented figure export directly from the browser.
+
+## Highlights
+
+- **Embedded frontend**: `static/index.html` is compiled into the binary, so deployment is just the executable.
+- **Layered configuration**: CLI flags, optional JSON config, optional user config, and UCSC chromosome-size fallback.
+- **Track management at runtime**: add, remove, and reorder server-managed tracks through the API.
+- **Practical browser workflow**: load server files, load remote URLs, save/load sessions, save SVG/PNG, and preserve session state across refresh and re-authentication.
+- **Security-minded local file access**: local paths are restricted to canonicalized `allowed_roots`; remote URLs are supported read-only.
 
 ## Quick start
 
-```bash
-genome_viewer                          # browse current dir, hg38 genome, auth on
-genome_viewer --genome mm10            # different genome
-genome_viewer --root ~/data/tracks     # add extra browsable directory
-genome_viewer --config tracks.json     # pre-defined tracks
-genome_viewer --bind 0.0.0.0:9000     # listen on all interfaces
-genome_viewer -p 9000                  # override port only
-genome_viewer --no-token               # disable authentication
-genome_viewer --token MY_SECRET        # use an explicit token
-genome_viewer --refresh-token          # generate & save token to user config
-```
-
-By default, the server binds to `127.0.0.1:62615`, uses the `hg38` genome, enables token authentication (auto-generated), and exposes the current working directory as a browsable root. At startup it prints the local URL and all detected network interface URLs. Open any of them in your browser to get an igv.js interface with a server-side file browser.
-
-## Installation
+### Install
 
 ```bash
-# From the repo
 cargo build --release
-# Binary at target/release/genome_viewer
+# binary: target/release/genome_viewer
 
-# Or install directly
+# or install into Cargo's bin dir
 cargo install --path .
 ```
 
-Requires Rust edition 2024.
+### Run
 
-## CLI options
+```bash
+genome_viewer
+genome_viewer --genome mm10
+genome_viewer --root ~/data/tracks
+genome_viewer --config example-config.json
+genome_viewer --bind 0.0.0.0:9000
+genome_viewer -p 9000
+genome_viewer --token MY_SECRET
+genome_viewer --refresh-token
+genome_viewer --no-token
+```
+
+Default behavior:
+
+- Binds to `0.0.0.0:62615`
+- Uses genome `hg38`
+- Enables token auth unless `--no-token` is set
+- Includes the current working directory as an allowed root unless `--no-cwd` is set
+
+At startup, the server prints a localhost URL plus detected non-loopback network URLs. Open one in your browser and log in with the printed token if auth is enabled.
+
+### Try the bundled example
+
+The repository includes a small demo config and example text tracks:
+
+```bash
+cargo run -- --config example-config.json
+```
+
+That config demonstrates:
+
+- `genome.default_locus`
+- `ui.allowed_roots`
+- local BED/GTF tracks
+- remote BigWig/BigBed sources
+
+## CLI reference
 
 | Flag | Description |
 |------|-------------|
-| `--config <path>` | JSON config file for pre-defined tracks. Accepts full config or tracks-only format. |
-| `--genome <name>` | Genome name (default: `hg38`). |
-| `--chrom-sizes <path>` | Path or URL to chromosome sizes file. Fetched from UCSC if omitted. |
-| `--bind <addr>` | Address to bind (default: `127.0.0.1:62615`). |
-| `-p`, `--port <port>` | Override the port in `--bind` without specifying a full address. |
-| `--token [value]` | Access token. Auto-generated by default; pass a value to set explicitly. |
-| `--no-token` | Disable token authentication entirely. |
-| `--refresh-token` | Generate a new token and save it to the user config (`~/.config/genome_viewer/config.yaml`). |
-| `--root <path>` | Additional browsable directory (repeatable). |
-| `--no-cwd` | Don't include the current directory as a browsable root. |
-| `--title <text>` | Title shown in the viewer. |
+| `--config <path>` | JSON config file. Supports a full config or a tracks-only config. |
+| `--genome <name>` | Genome name when not fixed by the JSON config. Default: `hg38`. |
+| `--chrom-sizes <path-or-url>` | Chromosome sizes source. Local path or URL. |
+| `--bind <addr>` | Bind address. Default: `0.0.0.0:62615`. |
+| `-p`, `--port <port>` | Override only the port portion of `--bind`. |
+| `--token [value]` | Enable auth with an explicit token, or auto-generate one if no value is given. |
+| `--no-token` | Disable authentication. |
+| `--refresh-token` | Generate a new token and save it to `~/.config/genome_viewer/config.yaml`. |
+| `--root <path>` | Add an allowed local root. Repeatable. |
+| `--no-cwd` | Do not add the current directory to allowed roots. |
+| `--title <text>` | Viewer title. |
 
 ## Configuration
 
-### User config (optional)
+### User config
 
-Persistent defaults in `~/.config/genome_viewer/config.yaml`:
+Optional defaults live in `~/.config/genome_viewer/config.yaml`:
 
 ```yaml
 genome: hg38
 chrom_sizes: ~/db/gencode/GRCh38/GRCh38.primary_assembly.genome.fa.chromsize
-token: abc123def456...    # fixed token (auto-loaded when --token is not given)
+token: abc123def456...
 allowed_roots:
   - ~/data/tracks
   - /shared/genomics
 ```
 
-The `token` field lets you persist a fixed token across sessions. Use `--refresh-token` to generate a new one and save it here automatically.
+Use `--refresh-token` to generate and save a new token there. The file is written with `0600` permissions.
 
-### JSON config file (optional)
+### JSON config
 
-Tracks-only format -- genome comes from CLI or user config:
+Tracks-only config:
 
 ```json
 {
@@ -93,14 +125,24 @@ Tracks-only format -- genome comes from CLI or user config:
 }
 ```
 
-Full format:
+Full config:
 
 ```json
 {
   "title": "My Viewer",
   "genome": {
     "name": "hg38",
-    "chrom_sizes": "/path/to/hg38.chrom.sizes"
+    "chrom_sizes": "/path/to/hg38.chrom.sizes",
+    "default_locus": {
+      "chrom": "chr1",
+      "start": 155184000,
+      "end": 155194000
+    }
+  },
+  "ui": {
+    "allowed_roots": [
+      "/data/tracks"
+    ]
   },
   "tracks": [
     {
@@ -108,108 +150,209 @@ Full format:
       "name": "CTCF Peaks",
       "kind": "bed",
       "source": "/path/to/peaks.bed",
-      "style": { "color": "#2196F3", "height": 50 }
+      "style": {
+        "color": "#2196F3",
+        "height": 50
+      }
     }
   ]
 }
 ```
 
-### Config resolution order
+### Effective precedence
 
-1. CLI args (`--genome`, `--chrom-sizes`, `--root`, `--title`, `--port`)
-2. JSON config file (`--config`)
-3. User YAML defaults (`~/.config/genome_viewer/config.yaml`)
-4. Remote fetch from UCSC (`hgdownload.cse.ucsc.edu`)
-5. Built-in defaults (`genome=hg38`, `bind=127.0.0.1:62615`, `title=genome_viewer`)
+The config is resolved per field, not by one blanket merge order:
 
-Allowed roots are **merged** from all sources. The current directory is always included unless `--no-cwd`.
+- If `--config` contains a `genome` section, that genome block wins over `--genome` and `--chrom-sizes`.
+- Otherwise `--genome` and `--chrom-sizes` override the user config.
+- If chromosome sizes are still missing, the server falls back to the UCSC URL for the selected genome.
+- If `--config` contains a `title`, it wins over `--title`.
+- Allowed roots are merged from:
+  - current working directory unless `--no-cwd`
+  - repeatable `--root` flags
+  - user config `allowed_roots`
+  - JSON config `ui.allowed_roots`
 
 ## Supported formats
 
-### Server-side track querying
+### Server-side queried tracks
 
-These formats are queried server-side and returned as JSON to the frontend:
+These are exposed through `/api/tracks/{id}/query`:
 
-| Format | Extensions | Query mode |
-|--------|-----------|------------|
-| BigWig | `.bw`, `.bigwig` | On-demand, binned with configurable window functions (mean/min/max/count/density) |
-| BigBed | `.bb`, `.bigbed` | On-demand via indexed range requests |
-| BED | `.bed`, `.bed.gz` | Preloaded into memory at startup, binary-searched at query time |
-| GTF | `.gtf`, `.gtf.gz` | Preloaded into memory at startup (1-based to 0-based coordinate conversion) |
+| Format | Extensions | Behavior |
+|--------|------------|----------|
+| BigWig | `.bw`, `.bigwig` | On-demand query with binning and window functions |
+| BigBed | `.bb`, `.bigbed` | On-demand indexed feature query |
+| BED | `.bed`, `.bed.gz` | Preloaded into memory at startup or add time |
+| GTF | `.gtf`, `.gtf.gz` | Preloaded into memory with 1-based to 0-based conversion |
 
-Both local files and remote URLs (`http://`, `https://`) are supported as track sources.
+Supported BigWig window functions:
 
-### File browser
+- `mean`
+- `min`
+- `max`
+- `count`
+- `density`
+- `none`
 
-The built-in file browser also shows these igv.js-compatible formats for direct loading (served as raw files to igv.js):
+### File browser / raw igv.js loading
 
-BAM, CRAM, VCF, GFF, GFF3, WIG, BedGraph, SEG (plus their index files: `.bai`, `.crai`, `.tbi`, `.csi`, `.idx`).
+The built-in file browser also exposes these igv.js-compatible formats as raw files via `/api/data`:
 
-## API endpoints
+- BAM
+- CRAM
+- VCF / VCF.GZ
+- BED / BED.GZ
+- GTF / GTF.GZ
+- GFF / GFF3
+- WIG
+- BedGraph
+- SEG
+- common index files such as `.bai`, `.crai`, `.tbi`, `.csi`, `.idx`
 
-All endpoints are under `/api/`:
+## Browser workflow
+
+- **Tracks > Server Files...**: browse configured local roots and load genomic files.
+- **Tracks > Load URL...**: load a remote igv.js-compatible track by URL.
+- **Session > Save Session / Load Session...**: export and restore IGV session JSON.
+- **Save Image > Save as SVG / Save as PNG**: use igv.js export for the current browser view.
+- **Save Image > Publication Figure...**: generate a cleaner figure-oriented SVG/PNG export from queried track data.
+
+The browser also stores session JSON in `sessionStorage` before refresh or auth redirect, then restores it on the next page load.
+
+## Authentication and local path security
+
+Authentication is enabled by default.
+
+- The server uses a token supplied via `--token`, loaded from user config, or auto-generated at startup.
+- Requests are authenticated via the `genome_viewer_token` cookie or `Authorization: Bearer <token>`.
+- Unauthenticated requests are redirected to a login page served by the app.
+- The auth cookie has `HttpOnly`, `SameSite=Strict`, and `Max-Age=86400`.
+
+Local file access is restricted:
+
+- local paths must resolve inside canonicalized `allowed_roots`
+- symlink traversal outside those roots is blocked by canonicalization before validation
+- if there are no allowed roots, UI-based local file loading is disabled
+
+Remote `http://` and `https://` track sources are allowed and bypass local path checks, but they are read-only sources.
+
+## API
+
+All endpoints live under `/api/`.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/config` | Full viewer config including chrom sizes |
-| `GET` | `/api/tracks/{id}/query?chrom=&start=&end=&bins=&window_function=` | Query track data |
-| `POST` | `/api/tracks` | Add a track at runtime |
-| `DELETE` | `/api/tracks/{id}` | Remove a track |
-| `POST` | `/api/tracks/reorder` | Reorder tracks |
-| `GET` | `/api/files?path=` | Browse server files (restricted to allowed roots) |
-| `GET` | `/api/data?path=` | Serve a raw file (restricted to allowed roots) |
-| `POST` | `/api/auth` | Token login |
+| `POST` | `/api/auth` | Token login form target |
+| `GET` | `/api/config` | Viewer config, chromosome sizes, tracks, UI metadata |
+| `GET` | `/api/files?path=` | Browse allowed local directories |
+| `GET` | `/api/data?path=` | Serve a local file inside allowed roots |
+| `POST` | `/api/tracks` | Add a runtime track |
+| `DELETE` | `/api/tracks/{id}` | Remove a runtime track |
+| `POST` | `/api/tracks/reorder` | Reorder all server-managed tracks |
+| `GET` | `/api/tracks/{id}/query?...` | Query signal or features for a region |
 
-### Query parameters for track queries
-
-- `chrom` (required) -- chromosome name
-- `start`, `end` (required) -- 0-based coordinates
-- `bins` (optional, default 800) -- number of bins for BigWig signal
-- `limit` (optional, default 2000) -- max features for BED/BigBed/GTF
-- `window_function` (optional, default `mean`) -- one of `mean`, `min`, `max`, `count`, `density`, `none`
-
-## Authentication
-
-Token authentication is **enabled by default**. On startup, the server auto-generates a token (printed to stderr) or loads one from the user config (`~/.config/genome_viewer/config.yaml`). The token is required via cookie or `Authorization: Bearer` header.
+### Add a track
 
 ```bash
-genome_viewer                          # auth on, auto-generated or config-saved token
-genome_viewer --token MY_SECRET        # use an explicit token
-genome_viewer --refresh-token          # generate a new token and save it to user config
-genome_viewer --no-token               # disable authentication entirely
+curl -X POST http://localhost:62615/api/tracks \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer YOUR_TOKEN' \
+  -d '{
+    "source": "/data/tracks/sample.bigWig",
+    "name": "Sample signal",
+    "kind": "bigwig"
+  }'
 ```
 
-Unauthenticated requests are redirected to a login page. The token cookie (`genome_viewer_token`) is valid for 24 hours.
+`kind` is optional if it can be inferred from the source extension.
 
-## Chromosome sizes resolution
+### Query a track
 
-Chromosome sizes are resolved in this order:
+```bash
+curl "http://localhost:62615/api/tracks/sample-bigwig/query?chrom=chr1&start=100000&end=120000&bins=800&window_function=mean" \
+  -H 'Authorization: Bearer YOUR_TOKEN'
+```
 
-1. `--chrom-sizes` CLI flag (local path or URL)
-2. `chrom_sizes` in `~/.config/genome_viewer/config.yaml`
-3. `genome` section in the JSON config file
-4. Auto-fetch from UCSC (`hgdownload.cse.ucsc.edu`)
+Query parameters:
 
-For common genomes (hg38, hg19, mm10, etc.), no configuration is needed -- chrom sizes are fetched automatically at startup.
+- `chrom` required
+- `start` required, 0-based
+- `end` required, 0-based exclusive
+- `bins` optional, default `800` for BigWig
+- `limit` optional, default `2000` for feature tracks
+- `window_function` optional, default `mean`
 
 ## Publication figure export
 
-The **Export > Publication Figure...** menu opens a modal for generating journal-quality figures from the current browser view. It queries track data server-side and renders a clean SVG with:
+The publication figure workflow renders a separate SVG, then optionally rasterizes it to PNG. It is intended for cleaner static figures than the raw igv.js screenshot.
 
-- **BigWig signal** — filled area plots with configurable y-axis
-- **BED/BigBed features** — colored rectangles with labels
-- **GTF gene tracks** — exons, UTRs, CDS, intron lines, strand arrows, and gene name labels
-- **Coordinate axis**, scale bar, region label, and ideogram (all toggleable)
+Current figure support includes:
 
-Configurable options include figure width (mm), track height, spacing, margins, font family/size, label position, per-track colors, and output DPI. Figures can be downloaded as SVG (vector) or PNG (rasterized at up to 1200 DPI).
+- BigWig signal area plots
+- BED / BigBed interval tracks
+- GTF gene models with exons, UTR/CDS structure, intron lines, strand arrows, and labels
+- coordinate axis
+- scale bar
+- region label
+- ideogram
 
-The generator works with server-managed tracks and also auto-registers file-browser tracks with the server API for querying. For igv.js built-in tracks (e.g., RefSeq genes), it reads features directly from the igv.js viewport cache.
+Configurable figure settings include width in mm, track heights, margins, spacing, font family, font size, label placement, per-track colors, and output DPI.
 
-## Logging
+The figure generator can use:
 
-Uses `tracing` with env-filter:
+- server-managed tracks from the backend
+- tracks loaded from the server file browser after auto-registering them through `POST /api/tracks`
+- some igv.js-managed feature tracks by reading their viewport cache
+
+## Chromosome sizes
+
+Chromosome sizes are resolved as follows:
+
+1. If `--config` contains `genome.chrom_sizes`, use that.
+2. Otherwise `--chrom-sizes` overrides the user config value.
+3. Otherwise use `chrom_sizes` from `~/.config/genome_viewer/config.yaml`.
+4. Otherwise fall back to the UCSC chrom sizes URL for the selected genome.
+
+For common assemblies such as `hg38`, `hg19`, `mm10`, and `mm39`, zero-config startup usually works out of the box.
+
+## Development
+
+Build:
 
 ```bash
-RUST_LOG=genome_viewer=debug genome_viewer
-RUST_LOG=genome_viewer=debug,tower_http=debug genome_viewer    # include HTTP request logs
+cargo build
+cargo build --release
 ```
+
+Test:
+
+```bash
+cargo test
+cargo test slugify
+cargo test -- --nocapture
+```
+
+Logging:
+
+```bash
+RUST_LOG=genome_viewer=debug cargo run
+RUST_LOG=genome_viewer=debug,tower_http=debug cargo run
+```
+
+## Architecture snapshot
+
+The project is intentionally small:
+
+- `src/main.rs`: CLI, Axum router, handlers, auth middleware, runtime state
+- `src/config.rs`: config loading, path normalization, chromosome-size loading, safe source reading
+- `src/model.rs`: API request/response types
+- `src/tracks.rs`: format inference, text-track parsing, BigWig/BigBed query logic
+- `static/index.html`: single-file frontend UI
+
+Key implementation details:
+
+- BigWig and BigBed access is synchronous in `bigtools`, so queries run in `spawn_blocking`.
+- BED and GTF tracks are parsed into in-memory per-chromosome vectors and queried by binary-search-like partitioning.
+- Internal server errors are logged server-side and returned as a generic `internal server error` message to the client.
+- The app prints clickable local and network URLs at startup.
