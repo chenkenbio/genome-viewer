@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -14,7 +14,7 @@ use axum::routing::{delete, get, post};
 use axum::{Form, Json, Router, middleware};
 use clap::Parser;
 use tower::ServiceExt;
-use tower_http::services::{ServeDir, ServeFile};
+use tower_http::services::ServeFile;
 
 use crate::config::{
     ResolvedConfig, TrackConfig, TrackKind, build_config, expand_path, is_remote_path,
@@ -306,9 +306,6 @@ async fn main() -> Result<()> {
         token,
     };
 
-    let static_dir = static_dir_path()?;
-    let static_service =
-        ServeDir::new(&static_dir).not_found_service(ServeFile::new(static_dir.join("index.html")));
     let app = Router::new()
         .route("/api/auth", post(auth_handler))
         .route("/api/config", get(get_config))
@@ -318,7 +315,7 @@ async fn main() -> Result<()> {
         .route("/api/tracks/reorder", post(reorder_tracks))
         .route("/api/tracks/{track_id}/query", get(query_track))
         .route("/api/tracks/{track_id}", delete(remove_track))
-        .fallback_service(static_service)
+        .fallback(serve_index)
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, auth_middleware));
 
@@ -780,13 +777,11 @@ fn default_track_name(source: &str, kind: &TrackKind) -> String {
         .unwrap_or_else(|| format!("{:?}", kind))
 }
 
-fn static_dir_path() -> Result<PathBuf> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let path = manifest_dir.join("static");
-    if !path.exists() {
-        bail!("static directory '{}' does not exist", path.display());
-    }
-    Ok(path)
+/// Embedded index.html — compiled into the binary so no external static dir is needed.
+const INDEX_HTML: &str = include_str!("../static/index.html");
+
+async fn serve_index() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], INDEX_HTML)
 }
 
 fn save_token_to_user_config(token: &str) -> Result<()> {

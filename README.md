@@ -11,7 +11,8 @@ A single-binary Rust web server for browsing genomic tracks via [igv.js](https:/
 - **Built-in file browser.** Browse directories on the server and add tracks at runtime. No need to pre-configure every file path or set up CORS.
 - **Layered configuration.** Persistent user defaults in YAML, optional JSON track configs, CLI flags, and automatic chrom sizes fetching from UCSC -- all merged in a well-defined order.
 - **Designed for bioinformatics workstations.** Run it on your lab server or HPC login node, open the URL on your laptop. No cloud deployment needed.
-- **Lightweight.** Single Rust binary with minimal dependencies. No JVM, no runtime interpreter.
+- **Lightweight.** Single Rust binary with minimal dependencies. No JVM, no runtime interpreter. The frontend is embedded directly in the binary — no external files needed.
+- **Publication-ready figure export.** Generate journal-quality SVG/PNG figures directly from the browser. Configurable layout dimensions (mm), fonts, per-track colors, scale bars, and high-DPI PNG export.
 
 ## Quick start
 
@@ -190,6 +191,19 @@ Chromosome sizes are resolved in this order:
 4. Auto-fetch from UCSC (`hgdownload.cse.ucsc.edu`)
 
 For common genomes (hg38, hg19, mm10, etc.), no configuration is needed -- chrom sizes are fetched automatically at startup.
+
+## Publication figure export
+
+The **Export > Publication Figure...** menu opens a modal for generating journal-quality figures from the current browser view. It queries track data server-side and renders a clean SVG with:
+
+- **BigWig signal** — filled area plots with configurable y-axis
+- **BED/BigBed features** — colored rectangles with labels
+- **GTF gene tracks** — exons, UTRs, CDS, intron lines, strand arrows, and gene name labels
+- **Coordinate axis**, scale bar, region label, and ideogram (all toggleable)
+
+Configurable options include figure width (mm), track height, spacing, margins, font family/size, label position, per-track colors, and output DPI. Figures can be downloaded as SVG (vector) or PNG (rasterized at up to 1200 DPI).
+
+The generator works with server-managed tracks and also auto-registers file-browser tracks with the server API for querying. For igv.js built-in tracks (e.g., RefSeq genes), it reads features directly from the igv.js viewport cache.
 
 ## Logging
 
