@@ -11,15 +11,36 @@ pub struct AppConfig {
     pub title: String,
     pub genome: GenomeConfig,
     #[serde(default)]
+    pub genomes: Vec<GenomeConfig>,
+    #[serde(default)]
     pub ui: UiConfig,
     pub tracks: Vec<TrackConfig>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ReferenceConfig {
+    pub fasta: Option<String>,
+    pub fasta_index: Option<String>,
+    pub compressed_fasta_index: Option<String>,
+    pub twobit: Option<String>,
+    pub cytoband: Option<String>,
+    pub alias: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct GenomeConfig {
     pub name: String,
+    pub label: Option<String>,
     pub chrom_sizes: String,
     pub default_locus: Option<Locus>,
+    #[serde(default)]
+    pub reference: ReferenceConfig,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResolvedGenomeConfig {
+    pub raw: GenomeConfig,
+    pub chrom_sizes: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -63,6 +84,7 @@ pub struct TrackConfig {
 pub struct ResolvedConfig {
     pub raw: AppConfig,
     pub chrom_sizes: BTreeMap<String, u64>,
+    pub genomes: Vec<ResolvedGenomeConfig>,
     pub track_map: HashMap<String, TrackConfig>,
 }
 
@@ -72,6 +94,8 @@ pub struct ResolvedConfig {
 pub struct InputConfig {
     pub title: Option<String>,
     pub genome: Option<GenomeConfig>,
+    #[serde(default)]
+    pub genomes: Vec<GenomeConfig>,
     #[serde(default)]
     pub ui: UiConfig,
     #[serde(default)]
@@ -133,18 +157,49 @@ pub fn load_input_config(path: &Path) -> Result<InputConfig> {
 /// Build a `ResolvedConfig` from individual components.
 pub fn build_config(
     title: String,
-    genome_name: String,
-    chrom_sizes_source: String,
-    default_locus: Option<Locus>,
+    genomes: Vec<GenomeConfig>,
+    active_genome_name: String,
     tracks: Vec<TrackConfig>,
 ) -> Result<ResolvedConfig> {
-    let chrom_sizes = load_chrom_sizes(&chrom_sizes_source)?;
-    if chrom_sizes.is_empty() {
-        bail!(
-            "chromosome sizes file '{}' is empty",
-            chrom_sizes_source
-        );
+    if genomes.is_empty() {
+        bail!("at least one genome must be configured");
     }
+
+    let mut resolved_genomes = Vec::with_capacity(genomes.len());
+    let mut active_genome = None;
+    let mut seen_genomes = std::collections::HashSet::new();
+
+    for genome in genomes {
+        if !seen_genomes.insert(genome.name.clone()) {
+            bail!("duplicate genome '{}'", genome.name);
+        }
+        let chrom_sizes = load_chrom_sizes(&genome.chrom_sizes)?;
+        if chrom_sizes.is_empty() {
+            bail!("chromosome sizes file '{}' is empty", genome.chrom_sizes);
+        }
+        let resolved = ResolvedGenomeConfig {
+            raw: genome.clone(),
+            chrom_sizes,
+        };
+        if genome.name == active_genome_name {
+            active_genome = Some(resolved.raw.clone());
+        }
+        resolved_genomes.push(resolved);
+    }
+
+    let active_genome = active_genome.ok_or_else(|| {
+        anyhow::anyhow!(
+            "active genome '{}' is not present in configured genomes",
+            active_genome_name
+        )
+    })?;
+
+    let chrom_sizes = resolved_genomes
+        .iter()
+        .find(|genome| genome.raw.name == active_genome_name)
+        .map(|genome| genome.chrom_sizes.clone())
+        .expect("active genome must exist");
+
     let mut track_map = HashMap::new();
     for track in &tracks {
         if track_map.insert(track.id.clone(), track.clone()).is_some() {
@@ -153,17 +208,18 @@ pub fn build_config(
     }
     let raw = AppConfig {
         title,
-        genome: GenomeConfig {
-            name: genome_name,
-            chrom_sizes: chrom_sizes_source,
-            default_locus,
-        },
+        genome: active_genome,
+        genomes: resolved_genomes
+            .iter()
+            .map(|genome| genome.raw.clone())
+            .collect(),
         ui: UiConfig::default(),
         tracks,
     };
     Ok(ResolvedConfig {
         raw,
         chrom_sizes,
+        genomes: resolved_genomes,
         track_map,
     })
 }
@@ -202,8 +258,7 @@ pub fn expand_path(path: &str) -> Result<PathBuf> {
 
 /// Expand only `~` (no $ENV vars). Used for user-facing path inputs to avoid info leaks.
 pub fn expand_path_safe(path: &str) -> Result<PathBuf> {
-    let expanded =
-        shellexpand::tilde(path);
+    let expanded = shellexpand::tilde(path);
     Ok(PathBuf::from(expanded.as_ref()))
 }
 
@@ -314,7 +369,9 @@ pub fn read_source_to_string(source: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_chrom_sizes, normalize_local_path};
+    use super::{
+        GenomeConfig, ReferenceConfig, build_config, load_chrom_sizes, normalize_local_path,
+    };
 
     #[test]
     fn parse_chrom_sizes_text() {
@@ -330,9 +387,54 @@ mod tests {
         assert!(normalized.ends_with("bar/test.bed"));
     }
 
+    #[test]
+    fn build_config_supports_multiple_genomes() {
+        let human = tempfile_content("chr1\t100\n");
+        let mouse = tempfile_content_named("mouse", "chrA\t200\n");
+        let config = build_config(
+            "viewer".to_string(),
+            vec![
+                GenomeConfig {
+                    name: "hg38".to_string(),
+                    label: Some("Human".to_string()),
+                    chrom_sizes: human.to_string_lossy().to_string(),
+                    default_locus: None,
+                    reference: ReferenceConfig::default(),
+                },
+                GenomeConfig {
+                    name: "mm10".to_string(),
+                    label: Some("Mouse".to_string()),
+                    chrom_sizes: mouse.to_string_lossy().to_string(),
+                    default_locus: None,
+                    reference: ReferenceConfig::default(),
+                },
+            ],
+            "mm10".to_string(),
+            vec![],
+        )
+        .unwrap();
+
+        assert_eq!(config.raw.genome.name, "mm10");
+        assert_eq!(config.genomes.len(), 2);
+        assert_eq!(config.chrom_sizes.get("chrA"), Some(&200));
+    }
+
     fn tempfile_content(contents: &str) -> std::path::PathBuf {
+        tempfile_content_named("default", contents)
+    }
+
+    fn tempfile_content_named(stem: &str, contents: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir();
-        let file = dir.join(format!("genome_viewer_test_{}.sizes", std::process::id()));
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let file = dir.join(format!(
+            "genome_viewer_test_{}_{}_{}.sizes",
+            stem,
+            std::process::id(),
+            unique
+        ));
         std::fs::write(&file, contents).unwrap();
         file
     }

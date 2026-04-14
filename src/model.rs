@@ -58,9 +58,29 @@ pub struct ApiConfigResponse {
     pub genome_name: String,
     pub chrom_sizes: BTreeMap<String, u64>,
     pub default_locus: Option<Locus>,
+    pub genomes: Vec<ApiGenomeResponse>,
     pub ui: UiConfigResponse,
     pub tracks: Vec<TrackConfig>,
     pub todos: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ApiGenomeReferenceResponse {
+    pub fasta: Option<String>,
+    pub fasta_index: Option<String>,
+    pub compressed_fasta_index: Option<String>,
+    pub twobit: Option<String>,
+    pub cytoband: Option<String>,
+    pub alias: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ApiGenomeResponse {
+    pub name: String,
+    pub label: String,
+    pub chrom_sizes: BTreeMap<String, u64>,
+    pub default_locus: Option<Locus>,
+    pub reference: ApiGenomeReferenceResponse,
 }
 
 #[derive(Clone, Debug, Serialize)]

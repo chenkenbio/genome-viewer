@@ -17,12 +17,14 @@ use tower::ServiceExt;
 use tower_http::services::ServeFile;
 
 use crate::config::{
-    ResolvedConfig, TrackConfig, TrackKind, build_config, default_chrom_sizes_url, expand_path,
-    is_remote_path, load_input_config, load_user_config, normalize_local_path,
+    GenomeConfig, ReferenceConfig, ResolvedConfig, TrackConfig, TrackKind, build_config,
+    default_chrom_sizes_url, expand_path, is_remote_path, load_input_config, load_user_config,
+    normalize_local_path,
 };
 use crate::model::{
-    AddTrackRequest, ApiConfigResponse, FileBrowserEntry, FileBrowserResponse,
-    ReorderTracksRequest, TrackResponse, UiConfigResponse, WindowFunction,
+    AddTrackRequest, ApiConfigResponse, ApiGenomeReferenceResponse, ApiGenomeResponse,
+    FileBrowserEntry, FileBrowserResponse, ReorderTracksRequest, TrackResponse, UiConfigResponse,
+    WindowFunction,
 };
 use crate::tracks::{
     TextTrack, build_text_tracks, igvjs_format, infer_track_kind, is_genomic_file, load_text_track,
@@ -32,6 +34,7 @@ use crate::tracks::{
 #[derive(Debug, Parser)]
 #[command(
     name = "genome_viewer",
+    version,
     about = "Genome browser server. Launch in any directory to browse genomic tracks."
 )]
 struct Args {
@@ -48,7 +51,7 @@ struct Args {
     #[arg(short, long)]
     port: Option<String>,
 
-    /// Genome name (default: hg38). Ignored when --config provides a genome section.
+    /// Genome name (default: hg38). Also selects the active genome when --config defines multiple genomes.
     #[arg(long)]
     genome: Option<String>,
 
@@ -176,8 +179,8 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let user_config = load_user_config();
 
-    // Determine genome name: CLI > user config > default
-    let genome_name = args
+    // Determine requested genome name: CLI > user config > default
+    let requested_genome_name = args
         .genome
         .as_deref()
         .or(user_config.genome.as_deref())
@@ -188,46 +191,75 @@ async fn main() -> Result<()> {
     let (config, config_roots) = if let Some(ref config_path) = args.config {
         let input = load_input_config(&expand_path(config_path)?)?;
         let config_roots = input.ui.allowed_roots.clone();
-
-        let (gname, chrom_sizes_source, default_locus) = if let Some(ref genome) = input.genome {
-            (
-                genome.name.clone(),
-                genome.chrom_sizes.clone(),
-                genome.default_locus.clone(),
-            )
-        } else {
-            let cs = resolve_chrom_sizes(
-                args.chrom_sizes.as_deref(),
-                user_config.chrom_sizes.as_deref(),
-                &genome_name,
-            )?;
-            (genome_name.clone(), cs, None)
-        };
-
         let title = input
             .title
             .or(args.title.clone())
             .unwrap_or_else(|| "genome_viewer".to_string());
 
-        let resolved = build_config(
-            title,
-            gname,
-            chrom_sizes_source,
-            default_locus,
-            input.tracks,
-        )?;
+        let (genomes, active_genome_name) = if !input.genomes.is_empty() {
+            if args.chrom_sizes.is_some() {
+                return Err(anyhow!(
+                    "--chrom-sizes cannot be used when --config defines multiple genomes"
+                ));
+            }
+            let active = if input
+                .genomes
+                .iter()
+                .any(|genome| genome.name == requested_genome_name)
+            {
+                requested_genome_name.clone()
+            } else {
+                input
+                    .genomes
+                    .first()
+                    .map(|genome| genome.name.clone())
+                    .ok_or_else(|| anyhow!("at least one genome must be configured"))?
+            };
+            (input.genomes, active)
+        } else if let Some(genome) = input.genome {
+            (vec![genome.clone()], genome.name)
+        } else {
+            let cs = resolve_chrom_sizes(
+                args.chrom_sizes.as_deref(),
+                user_config.chrom_sizes.as_deref(),
+                &requested_genome_name,
+            )?;
+            (
+                vec![GenomeConfig {
+                    name: requested_genome_name.clone(),
+                    label: None,
+                    chrom_sizes: cs,
+                    default_locus: None,
+                    reference: ReferenceConfig::default(),
+                }],
+                requested_genome_name.clone(),
+            )
+        };
+
+        let resolved = build_config(title, genomes, active_genome_name, input.tracks)?;
         (Arc::new(resolved), config_roots)
     } else {
         let cs = resolve_chrom_sizes(
             args.chrom_sizes.as_deref(),
             user_config.chrom_sizes.as_deref(),
-            &genome_name,
+            &requested_genome_name,
         )?;
         let title = args
             .title
             .clone()
             .unwrap_or_else(|| "genome_viewer".to_string());
-        let resolved = build_config(title, genome_name.clone(), cs, None, vec![])?;
+        let resolved = build_config(
+            title,
+            vec![GenomeConfig {
+                name: requested_genome_name.clone(),
+                label: None,
+                chrom_sizes: cs,
+                default_locus: None,
+                reference: ReferenceConfig::default(),
+            }],
+            requested_genome_name.clone(),
+            vec![],
+        )?;
         (Arc::new(resolved), vec![])
     };
 
@@ -361,6 +393,12 @@ async fn get_config(State(state): State<AppState>) -> Json<ApiConfigResponse> {
         genome_name: state.config.raw.genome.name.clone(),
         chrom_sizes: state.config.chrom_sizes.clone(),
         default_locus: state.config.raw.genome.default_locus.clone(),
+        genomes: state
+            .config
+            .genomes
+            .iter()
+            .map(api_genome_response)
+            .collect(),
         ui: UiConfigResponse {
             allowed_roots: state
                 .allowed_roots
@@ -372,6 +410,27 @@ async fn get_config(State(state): State<AppState>) -> Json<ApiConfigResponse> {
         tracks,
         todos: vec!["HDF5-backed tracks are planned but not implemented yet.".to_string()],
     })
+}
+
+fn api_genome_response(genome: &crate::config::ResolvedGenomeConfig) -> ApiGenomeResponse {
+    ApiGenomeResponse {
+        name: genome.raw.name.clone(),
+        label: genome
+            .raw
+            .label
+            .clone()
+            .unwrap_or_else(|| genome.raw.name.clone()),
+        chrom_sizes: genome.chrom_sizes.clone(),
+        default_locus: genome.raw.default_locus.clone(),
+        reference: ApiGenomeReferenceResponse {
+            fasta: genome.raw.reference.fasta.clone(),
+            fasta_index: genome.raw.reference.fasta_index.clone(),
+            compressed_fasta_index: genome.raw.reference.compressed_fasta_index.clone(),
+            twobit: genome.raw.reference.twobit.clone(),
+            cytoband: genome.raw.reference.cytoband.clone(),
+            alias: genome.raw.reference.alias.clone(),
+        },
+    }
 }
 
 async fn list_files(

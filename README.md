@@ -160,11 +160,45 @@ Full config:
 }
 ```
 
+Multiple genomes:
+
+```json
+{
+  "title": "Multi-genome Viewer",
+  "genomes": [
+    {
+      "name": "hg38",
+      "label": "Human (hg38)",
+      "chrom_sizes": "~/db/gencode/GRCh38/GRCh38.primary_assembly.genome.fa.chromsize"
+    },
+    {
+      "name": "custom_asm",
+      "label": "Custom Assembly",
+      "chrom_sizes": "/data/custom/custom_asm.chrom.sizes",
+      "default_locus": {
+        "chrom": "chr1",
+        "start": 0,
+        "end": 50000
+      },
+      "reference": {
+        "fasta": "/data/custom/custom_asm.fa.gz",
+        "fasta_index": "/data/custom/custom_asm.fa.gz.fai",
+        "compressed_fasta_index": "/data/custom/custom_asm.fa.gz.gzi",
+        "cytoband": "/data/custom/custom_asm.cytoBand.txt",
+        "alias": "/data/custom/custom_asm.alias.tsv"
+      }
+    }
+  ],
+  "tracks": []
+}
+```
+
 ### Effective precedence
 
 The config is resolved per field, not by one blanket merge order:
 
 - If `--config` contains a `genome` section, that genome block wins over `--genome` and `--chrom-sizes`.
+- If `--config` contains `genomes`, those genomes define the genome menu. `--genome` selects the initial genome if it matches one of them.
 - Otherwise `--genome` and `--chrom-sizes` override the user config.
 - If chromosome sizes are still missing, the server falls back to the UCSC URL for the selected genome.
 - If `--config` contains a `title`, it wins over `--title`.

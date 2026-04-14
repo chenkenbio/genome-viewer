@@ -209,15 +209,7 @@
         <!-- Genome -->
         <li class="nav-item dropdown">
           <a class="nav-link dropdown-toggle" href="#" data-bs-toggle="dropdown">Genome</a>
-          <ul class="dropdown-menu" id="genomeMenu">
-            <li><a class="dropdown-item" href="#" data-genome="hg38">hg38 (Human)</a></li>
-            <li><a class="dropdown-item" href="#" data-genome="hg19">hg19 (Human)</a></li>
-            <li><a class="dropdown-item" href="#" data-genome="mm39">mm39 (Mouse)</a></li>
-            <li><a class="dropdown-item" href="#" data-genome="mm10">mm10 (Mouse)</a></li>
-            <li><a class="dropdown-item" href="#" data-genome="dm6">dm6 (Drosophila)</a></li>
-            <li><a class="dropdown-item" href="#" data-genome="sacCer3">sacCer3 (Yeast)</a></li>
-            <li><a class="dropdown-item" href="#" data-genome="ce11">ce11 (C. elegans)</a></li>
-          </ul>
+          <ul class="dropdown-menu" id="genomeMenu"></ul>
         </li>
         <!-- Tracks -->
         <li class="nav-item dropdown">
@@ -508,6 +500,16 @@
 (function () {
   'use strict';
 
+  const FALLBACK_GENOMES = [
+    { name: 'hg38', label: 'hg38 (Human)', chrom_sizes: null, default_locus: null, reference: {} },
+    { name: 'hg19', label: 'hg19 (Human)', chrom_sizes: null, default_locus: null, reference: {} },
+    { name: 'mm39', label: 'mm39 (Mouse)', chrom_sizes: null, default_locus: null, reference: {} },
+    { name: 'mm10', label: 'mm10 (Mouse)', chrom_sizes: null, default_locus: null, reference: {} },
+    { name: 'dm6', label: 'dm6 (Drosophila)', chrom_sizes: null, default_locus: null, reference: {} },
+    { name: 'sacCer3', label: 'sacCer3 (Yeast)', chrom_sizes: null, default_locus: null, reference: {} },
+    { name: 'ce11', label: 'ce11 (C. elegans)', chrom_sizes: null, default_locus: null, reference: {} },
+  ];
+
   let browser = null;
   let currentGenome = 'hg38';
   let serverConfig = null;
@@ -542,6 +544,89 @@
     return null;
   }
 
+  function configuredGenomes() {
+    if (serverConfig && Array.isArray(serverConfig.genomes) && serverConfig.genomes.length > 0) {
+      return serverConfig.genomes;
+    }
+    return FALLBACK_GENOMES;
+  }
+
+  function findGenomeConfig(genomeName) {
+    if (!genomeName) return null;
+    return configuredGenomes().find((genome) => genome.name === genomeName) || null;
+  }
+
+  function isRemoteUrl(value) {
+    return /^https?:\/\//i.test(String(value || ''));
+  }
+
+  function toIgvUrl(value) {
+    if (!value) return null;
+    return isRemoteUrl(value) ? value : '/api/data?path=' + encodeURIComponent(value);
+  }
+
+  function locusToString(locus) {
+    if (!locus || !locus.chrom) return null;
+    const start = Number(locus.start || 0) + 1;
+    const end = Number(locus.end || 0);
+    return locus.chrom + ':' + start + '-' + end;
+  }
+
+  function buildGenomeList() {
+    if (!(serverConfig && Array.isArray(serverConfig.genomes) && serverConfig.genomes.length > 0)) {
+      return [];
+    }
+    return configuredGenomes().map((genome) => {
+      const reference = genome.reference || {};
+      const definition = {
+        id: genome.name,
+        name: genome.label || genome.name,
+      };
+      if (reference.fasta) definition.fastaURL = toIgvUrl(reference.fasta);
+      if (reference.fasta_index) definition.indexURL = toIgvUrl(reference.fasta_index);
+      if (reference.compressed_fasta_index) definition.compressedIndexURL = toIgvUrl(reference.compressed_fasta_index);
+      if (reference.twobit) definition.twoBitURL = toIgvUrl(reference.twobit);
+      if (reference.cytoband) definition.cytobandURL = toIgvUrl(reference.cytoband);
+      if (reference.alias) definition.aliasURL = toIgvUrl(reference.alias);
+      return definition;
+    });
+  }
+
+  function activeGenomeIdFromOptions(options) {
+    if (!options) return null;
+    if (options.genome) return options.genome;
+    if (options.reference && options.reference.id) return options.reference.id;
+    if (options.reference && options.reference.name) return options.reference.name;
+    return null;
+  }
+
+  function setActiveGenome(genomeName) {
+    const genome = findGenomeConfig(genomeName);
+    currentGenome = genomeName || currentGenome;
+    document.getElementById('genomeLabel').textContent = genome
+      ? (genome.label || genome.name)
+      : currentGenome;
+
+    if (serverConfig && genome) {
+      serverConfig.genome_name = genome.name;
+      serverConfig.chrom_sizes = genome.chrom_sizes || {};
+      serverConfig.default_locus = genome.default_locus || null;
+    }
+  }
+
+  function renderGenomeMenu() {
+    const menu = document.getElementById('genomeMenu');
+    const genomes = configuredGenomes();
+    menu.innerHTML = '';
+
+    genomes.forEach((genome) => {
+      const item = document.createElement('li');
+      item.innerHTML = '<a class="dropdown-item" href="#" data-genome="' +
+        escapeHtml(genome.name) + '">' + escapeHtml(genome.label || genome.name) + '</a>';
+      menu.appendChild(item);
+    });
+  }
+
   // ── Initialization ──────────────────────────────────────────────
 
   async function init() {
@@ -550,10 +635,16 @@
       const resp = await apiFetch('/api/config');
       if (resp.ok) {
         serverConfig = await resp.json();
+        if (serverConfig.genome_name) {
+          currentGenome = serverConfig.genome_name;
+        }
       }
     } catch (_) {
       // Server config is optional — igv.js can work standalone
     }
+
+    renderGenomeMenu();
+    setActiveGenome(currentGenome);
 
     // Restore previous session if available (survives refresh / re-auth)
     const saved = popSavedSession();
@@ -574,17 +665,27 @@
     const container = document.getElementById('igv-container');
     container.innerHTML = '';
 
-    const options = sessionOptions || {
-      genome: genome,
-      showNavigation: true,
-      showRuler: true,
-      showCenterGuide: true,
-      showCursorTrackingGuide: true,
-    };
+    const genomeName = activeGenomeIdFromOptions(sessionOptions) || genome || currentGenome;
+    const genomeConfig = findGenomeConfig(genomeName);
+    const options = sessionOptions
+      ? {
+          ...sessionOptions,
+          genomeList: buildGenomeList(),
+          loadDefaultGenomes: true,
+        }
+      : {
+          genome: genomeName,
+          genomeList: buildGenomeList(),
+          loadDefaultGenomes: true,
+          locus: locusToString(genomeConfig && genomeConfig.default_locus),
+          showNavigation: true,
+          showRuler: true,
+          showCenterGuide: true,
+          showCursorTrackingGuide: true,
+        };
 
     browser = await igv.createBrowser(container, options);
-    currentGenome = options.genome || genome || currentGenome;
-    document.getElementById('genomeLabel').textContent = currentGenome;
+    setActiveGenome(genomeName);
   }
 
   // ── Genome switching ────────────────────────────────────────────
