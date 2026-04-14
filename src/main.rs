@@ -17,16 +17,16 @@ use tower::ServiceExt;
 use tower_http::services::ServeFile;
 
 use crate::config::{
-    ResolvedConfig, TrackConfig, TrackKind, build_config, expand_path, is_remote_path,
-    default_chrom_sizes_url, load_input_config, load_user_config, normalize_local_path,
+    ResolvedConfig, TrackConfig, TrackKind, build_config, default_chrom_sizes_url, expand_path,
+    is_remote_path, load_input_config, load_user_config, normalize_local_path,
 };
 use crate::model::{
     AddTrackRequest, ApiConfigResponse, FileBrowserEntry, FileBrowserResponse,
     ReorderTracksRequest, TrackResponse, UiConfigResponse, WindowFunction,
 };
 use crate::tracks::{
-    TextTrack, build_text_tracks, igvjs_format, infer_track_kind, is_genomic_file,
-    load_text_track, query_bigbed, query_bigwig, query_text_track,
+    TextTrack, build_text_tracks, igvjs_format, infer_track_kind, is_genomic_file, load_text_track,
+    query_bigbed, query_bigwig, query_text_track,
 };
 
 #[derive(Debug, Parser)]
@@ -40,13 +40,13 @@ struct Args {
     #[arg(long)]
     config: Option<String>,
 
-    /// Address to bind the server.
-    #[arg(long, default_value = "0.0.0.0:62615")]
+    /// Address to bind the server. Use port 0 to enable random port selection.
+    #[arg(long, default_value = "0.0.0.0:0")]
     bind: String,
 
-    /// Port (overrides the port in --bind).
+    /// Port or inclusive port range (for example: 9000 or 50000-60000).
     #[arg(short, long)]
-    port: Option<u16>,
+    port: Option<String>,
 
     /// Genome name (default: hg38). Ignored when --config provides a genome section.
     #[arg(long)]
@@ -158,6 +158,12 @@ struct AuthForm {
     token: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PortSelection {
+    Fixed(u16),
+    Range { start: u16, end: u16 },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -203,7 +209,13 @@ async fn main() -> Result<()> {
             .or(args.title.clone())
             .unwrap_or_else(|| "genome_viewer".to_string());
 
-        let resolved = build_config(title, gname, chrom_sizes_source, default_locus, input.tracks)?;
+        let resolved = build_config(
+            title,
+            gname,
+            chrom_sizes_source,
+            default_locus,
+            input.tracks,
+        )?;
         (Arc::new(resolved), config_roots)
     } else {
         let cs = resolve_chrom_sizes(
@@ -319,16 +331,12 @@ async fn main() -> Result<()> {
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, auth_middleware));
 
-    let mut bind_addr: SocketAddr = args
+    let bind_addr: SocketAddr = args
         .bind
         .parse()
         .with_context(|| format!("failed to parse bind address '{}'", args.bind))?;
-    if let Some(port) = args.port {
-        bind_addr.set_port(port);
-    }
-    let listener = tokio::net::TcpListener::bind(bind_addr)
-        .await
-        .with_context(|| format!("failed to bind {}", bind_addr))?;
+    let port_selection = resolve_port_selection(&bind_addr, args.port.as_deref())?;
+    let listener = bind_listener(bind_addr, port_selection).await?;
 
     let addr = listener.local_addr()?;
     let url = display_url(&addr);
@@ -708,6 +716,95 @@ fn resolve_chrom_sizes(
     Ok(url)
 }
 
+fn parse_port_spec(value: &str) -> Result<PortSelection> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("port must not be empty"));
+    }
+
+    if let Some((start, end)) = trimmed.split_once('-') {
+        let start = start
+            .trim()
+            .parse::<u16>()
+            .with_context(|| format!("invalid port '{}'", start.trim()))?;
+        let end = end
+            .trim()
+            .parse::<u16>()
+            .with_context(|| format!("invalid port '{}'", end.trim()))?;
+        if start > end {
+            return Err(anyhow!(
+                "invalid port range '{}': start must be less than or equal to end",
+                trimmed
+            ));
+        }
+        return Ok(PortSelection::Range { start, end });
+    }
+
+    let port = trimmed
+        .parse::<u16>()
+        .with_context(|| format!("invalid port '{}'", trimmed))?;
+    Ok(PortSelection::Fixed(port))
+}
+
+fn resolve_port_selection(bind_addr: &SocketAddr, port: Option<&str>) -> Result<PortSelection> {
+    match port {
+        Some(value) => parse_port_spec(value),
+        None if bind_addr.port() == 0 => Ok(PortSelection::Range {
+            start: 50_000,
+            end: 60_000,
+        }),
+        None => Ok(PortSelection::Fixed(bind_addr.port())),
+    }
+}
+
+async fn bind_listener(
+    bind_addr: SocketAddr,
+    port_selection: PortSelection,
+) -> Result<tokio::net::TcpListener> {
+    match port_selection {
+        PortSelection::Fixed(port) => {
+            let addr = SocketAddr::new(bind_addr.ip(), port);
+            tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("failed to bind {}", addr))
+        }
+        PortSelection::Range { start, end } => {
+            let total_ports = usize::from(end - start) + 1;
+            let offset = random_index(total_ports)?;
+            let mut last_error = None;
+
+            for step in 0..total_ports {
+                let port = start + ((offset + step) % total_ports) as u16;
+                let addr = SocketAddr::new(bind_addr.ip(), port);
+                match tokio::net::TcpListener::bind(addr).await {
+                    Ok(listener) => return Ok(listener),
+                    Err(error) => last_error = Some((addr, error)),
+                }
+            }
+
+            let detail = last_error
+                .map(|(addr, error)| format!("last error binding {}: {}", addr, error))
+                .unwrap_or_else(|| "no bind attempts were made".to_string());
+            Err(anyhow!(
+                "failed to bind any port in range {}-{} ({})",
+                start,
+                end,
+                detail
+            ))
+        }
+    }
+}
+
+fn random_index(upper_bound: usize) -> Result<usize> {
+    if upper_bound == 0 {
+        return Err(anyhow!("upper_bound must be greater than zero"));
+    }
+    let mut bytes = [0u8; 8];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|error| anyhow!("failed to generate random port offset: {}", error))?;
+    Ok((u64::from_le_bytes(bytes) % upper_bound as u64) as usize)
+}
+
 fn validate_local_source(state: &AppState, source: &str) -> Result<PathBuf, AppError> {
     let path = normalize_local_path(source).map_err(AppError::from)?;
     if state.allowed_roots.is_empty() {
@@ -781,7 +878,10 @@ fn default_track_name(source: &str, kind: &TrackKind) -> String {
 const INDEX_HTML: &str = include_str!("../static/index.html");
 
 async fn serve_index() -> impl IntoResponse {
-    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], INDEX_HTML)
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        INDEX_HTML,
+    )
 }
 
 fn save_token_to_user_config(token: &str) -> Result<()> {
@@ -919,10 +1019,7 @@ async fn auth_middleware(
     resp
 }
 
-async fn auth_handler(
-    State(state): State<AppState>,
-    Form(form): Form<AuthForm>,
-) -> Response {
+async fn auth_handler(State(state): State<AppState>, Form(form): Form<AuthForm>) -> Response {
     let Some(ref expected) = state.token else {
         return Redirect::to("/").into_response();
     };
@@ -1001,8 +1098,12 @@ const LOGIN_PAGE_ERROR: &str = r#"<!doctype html>
 
 #[cfg(test)]
 mod tests {
-    use super::{is_within_allowed_roots, slugify};
+    use super::{
+        PortSelection, is_within_allowed_roots, parse_port_spec, resolve_port_selection, slugify,
+    };
+    use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
+    use std::str::FromStr;
 
     #[test]
     fn slugify_uses_safe_ascii_ids() {
@@ -1020,5 +1121,51 @@ mod tests {
             &roots,
             Path::new("/data/other/a.bed")
         ));
+    }
+
+    #[test]
+    fn parse_port_spec_accepts_single_port() {
+        assert_eq!(parse_port_spec("9000").unwrap(), PortSelection::Fixed(9000));
+    }
+
+    #[test]
+    fn parse_port_spec_accepts_range() {
+        assert_eq!(
+            parse_port_spec("50000-60000").unwrap(),
+            PortSelection::Range {
+                start: 50_000,
+                end: 60_000,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_port_spec_rejects_descending_range() {
+        let error = parse_port_spec("60000-50000").unwrap_err().to_string();
+        assert!(error.contains("start must be less than or equal to end"));
+    }
+
+    #[test]
+    fn resolve_port_selection_uses_default_random_range_for_bind_port_zero() {
+        let bind_addr = SocketAddr::from_str("0.0.0.0:0").unwrap();
+        assert_eq!(
+            resolve_port_selection(&bind_addr, None).unwrap(),
+            PortSelection::Range {
+                start: 50_000,
+                end: 60_000,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_port_selection_prefers_explicit_port_arg() {
+        let bind_addr = SocketAddr::from_str("0.0.0.0:7000").unwrap();
+        assert_eq!(
+            resolve_port_selection(&bind_addr, Some("52000-52010")).unwrap(),
+            PortSelection::Range {
+                start: 52_000,
+                end: 52_010,
+            }
+        );
     }
 }

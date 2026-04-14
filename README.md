@@ -46,6 +46,7 @@ genome_viewer --root ~/data/tracks
 genome_viewer --config example-config.json
 genome_viewer --bind 0.0.0.0:9000
 genome_viewer -p 9000
+genome_viewer --port 52000-53000
 genome_viewer --token MY_SECRET
 genome_viewer --refresh-token
 genome_viewer --no-token
@@ -53,7 +54,7 @@ genome_viewer --no-token
 
 Default behavior:
 
-- Binds to `0.0.0.0:62615`
+- Binds to `0.0.0.0` and picks a random free port in `50000-60000`
 - Uses genome `hg38`
 - Enables token auth unless `--no-token` is set
 - Includes the current working directory as an allowed root unless `--no-cwd` is set
@@ -82,8 +83,8 @@ That config demonstrates:
 | `--config <path>` | JSON config file. Supports a full config or a tracks-only config. |
 | `--genome <name>` | Genome name when not fixed by the JSON config. Default: `hg38`. |
 | `--chrom-sizes <path-or-url>` | Chromosome sizes source. Local path or URL. |
-| `--bind <addr>` | Bind address. Default: `0.0.0.0:62615`. |
-| `-p`, `--port <port>` | Override only the port portion of `--bind`. |
+| `--bind <addr>` | Bind address. If the bind port is `0` and `--port` is unset, the server chooses a random free port in `50000-60000`. |
+| `-p`, `--port <port-or-range>` | Override only the port portion of `--bind`. Accepts either a fixed port like `9000` or an inclusive range like `52000-53000`. |
 | `--token [value]` | Enable auth with an explicit token, or auto-generate one if no value is given. |
 | `--no-token` | Disable authentication. |
 | `--refresh-token` | Generate a new token and save it to `~/.config/genome_viewer/config.yaml`. |
@@ -255,7 +256,7 @@ All endpoints live under `/api/`.
 ### Add a track
 
 ```bash
-curl -X POST http://localhost:62615/api/tracks \
+curl -X POST http://localhost:<port>/api/tracks \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer YOUR_TOKEN' \
   -d '{
@@ -270,7 +271,7 @@ curl -X POST http://localhost:62615/api/tracks \
 ### Query a track
 
 ```bash
-curl "http://localhost:62615/api/tracks/sample-bigwig/query?chrom=chr1&start=100000&end=120000&bins=800&window_function=mean" \
+curl "http://localhost:<port>/api/tracks/sample-bigwig/query?chrom=chr1&start=100000&end=120000&bins=800&window_function=mean" \
   -H 'Authorization: Bearer YOUR_TOKEN'
 ```
 
