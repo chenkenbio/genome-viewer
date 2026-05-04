@@ -221,6 +221,8 @@ These are exposed through `/api/tracks/{id}/query`:
 | BED | `.bed`, `.bed.gz` | Preloaded into memory at startup or add time |
 | GTF | `.gtf`, `.gtf.gz` | Preloaded into memory with 1-based to 0-based conversion |
 
+Both plain `gzip` and multi-member `bgzip` are accepted for `.bed.gz` / `.gtf.gz`, decoded with `flate2`'s `MultiGzDecoder` (single-member `gzip` would silently truncate bgzipped files).
+
 Supported BigWig window functions:
 
 - `mean`
@@ -244,6 +246,8 @@ The built-in file browser also exposes these igv.js-compatible formats as raw fi
 - BedGraph
 - SEG
 - common index files such as `.bai`, `.crai`, `.tbi`, `.csi`, `.idx`
+
+For plain-gzipped (non-bgzip) text formats (`.bed.gz`, `.gtf.gz`, `.gff.gz`, `.gff3.gz`, `.bedgraph.gz`), clicking the file in the browser auto-registers it through `POST /api/tracks` and serves features via the server-side query endpoint with an igv.js custom source. This avoids igv.js's bgzip+tabix assumption that would otherwise require a `.tbi` sibling. When the server actually finds a real `.tbi`/`.csi`/`.bai`/`.crai` next to the data file, the file browser uses igv.js's native indexed loader instead.
 
 ## Browser workflow
 
@@ -280,8 +284,8 @@ All endpoints live under `/api/`.
 |--------|------|-------------|
 | `POST` | `/api/auth` | Token login form target |
 | `GET` | `/api/config` | Viewer config, chromosome sizes, tracks, UI metadata |
-| `GET` | `/api/files?path=` | Browse allowed local directories |
-| `GET` | `/api/data?path=` | Serve a local file inside allowed roots |
+| `GET` | `/api/files?path=` | Browse allowed local directories. Each entry includes `index_path` when a real Tabix/BAM/CRAM sibling index exists on disk. |
+| `GET` | `/api/data?path=[&decompress=1]` | Serve a local file inside allowed roots. With `decompress=1` on a `.gz` path, the body is gunzipped on the fly (`text/plain`, `Cache-Control: no-store`). |
 | `POST` | `/api/tracks` | Add a runtime track |
 | `DELETE` | `/api/tracks/{id}` | Remove a runtime track |
 | `POST` | `/api/tracks/reorder` | Reorder all server-managed tracks |
@@ -375,6 +379,15 @@ RUST_LOG=genome_viewer=debug cargo run
 RUST_LOG=genome_viewer=debug,tower_http=debug cargo run
 ```
 
+## Troubleshooting
+
+The frontend ships with two small in-page diagnostics:
+
+- **Build-tag badge** in the navbar (e.g. `gv-build-2026-05-04-…`). Confirms which version of the SPA the browser actually loaded — useful when you've just rebuilt the binary and want to make sure your browser is not showing cached HTML. The `/` route sets `Cache-Control: no-store` so a normal refresh should bust the cache; if the badge does not match the running binary, try a hard refresh or open the URL in an Incognito window.
+- **`[debug]` toggle** next to the build-tag badge. Click it to reveal a bottom-left overlay that logs every `fetch` and `XMLHttpRequest` (including igv.js's external reference fetches), an error banner for uncaught exceptions and unhandled rejections, and a 20-second watchdog around `igv.createBrowser`. If the page hangs on init, the overlay shows exactly which request is pending and the watchdog surfaces a banner explaining what's stuck.
+
+If a track click leaves a spinner on the track row, expand the overlay and look for the `xhr -> POST /api/tracks` and `xhr -> GET /api/tracks/{id}/query?...` pair: missing query, non-200 response, or empty `features` body all point to a different bug than a missing build.
+
 ## Architecture snapshot
 
 The project is intentionally small:
@@ -389,5 +402,7 @@ Key implementation details:
 
 - BigWig and BigBed access is synchronous in `bigtools`, so queries run in `spawn_blocking`.
 - BED and GTF tracks are parsed into in-memory per-chromosome vectors and queried by binary-search-like partitioning.
+- Gzip / bgzip decoding uses `flate2::read::MultiGzDecoder`, so multi-member bgzip streams are fully decoded instead of silently truncated at the first member.
+- The file browser populates each entry's `index_path` by probing the filesystem for the real sibling index (`.tbi`/`.csi`/`.bai`/`.crai`) rather than guessing by convention; this lets the SPA decide between igv.js's indexed loader and server-side parsing without 404 round-trips.
 - Internal server errors are logged server-side and returned as a generic `internal server error` message to the client.
 - The app prints clickable local and network URLs at startup.
