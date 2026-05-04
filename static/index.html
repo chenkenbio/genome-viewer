@@ -500,6 +500,137 @@
 (function () {
   'use strict';
 
+  // Build tag, visible in the navbar — proves which version of the SPA the
+  // browser actually loaded (cache-busting check).
+  const BUILD_TAG = 'gv-build-2026-05-04-bedgz-fix-r5-genomelist-fix';
+  console.log('[genome_viewer] build:', BUILD_TAG);
+  document.addEventListener('DOMContentLoaded', () => {
+    const nav = document.querySelector('.navbar-igv') || document.body;
+    const tag = document.createElement('span');
+    tag.className = 'badge bg-info text-dark ms-2';
+    tag.style.fontSize = '10px';
+    tag.style.fontWeight = '500';
+    tag.textContent = BUILD_TAG;
+    tag.title = 'genome_viewer build';
+    nav.appendChild(tag);
+
+    // Live request log overlay (toggle with the [debug] badge).
+    const debugBadge = document.createElement('span');
+    debugBadge.className = 'badge bg-warning text-dark ms-2';
+    debugBadge.style.cssText = 'font-size:10px;cursor:pointer;';
+    debugBadge.textContent = '[debug]';
+    debugBadge.title = 'click to toggle the live request log';
+    debugBadge.onclick = () => {
+      const o = document.getElementById('gv-debug-overlay');
+      if (o) o.style.display = (o.style.display === 'none' ? 'block' : 'none');
+    };
+    nav.appendChild(debugBadge);
+  });
+
+  // ── Live request log overlay ───────────────────────────────────
+  // Always-on capture of every fetch + XHR. Shown as a fixed bottom-left
+  // panel so the user can copy the trace verbatim if a track gets stuck.
+  const gvLog = [];
+  function gvLogEntry(s) {
+    const stamp = new Date().toISOString().substr(11, 12);
+    gvLog.push('[' + stamp + '] ' + s);
+    if (gvLog.length > 200) gvLog.shift();
+    const o = document.getElementById('gv-debug-overlay');
+    if (o) o.textContent = gvLog.join('\n');
+  }
+  document.addEventListener('DOMContentLoaded', () => {
+    const o = document.createElement('pre');
+    o.id = 'gv-debug-overlay';
+    o.style.cssText = 'position:fixed;left:8px;bottom:8px;width:640px;max-height:340px;' +
+      'overflow:auto;background:rgba(0,0,0,0.88);color:#0f0;font:11px monospace;' +
+      'padding:8px;border-radius:6px;z-index:9998;display:none;white-space:pre-wrap;' +
+      'word-break:break-all;';
+    o.textContent = '(no requests yet)';
+    document.body.appendChild(o);
+  });
+
+  // Wrap fetch
+  (function () {
+    const _fetch = window.fetch;
+    window.fetch = function (input, init) {
+      const url = (typeof input === 'string') ? input : (input && input.url) || String(input);
+      const method = (init && init.method) || 'GET';
+      gvLogEntry('fetch -> ' + method + ' ' + url);
+      return _fetch.call(this, input, init).then(
+        r => { gvLogEntry('fetch <- ' + r.status + ' ' + url); return r; },
+        e => { gvLogEntry('fetch !! ' + (e && e.message || e) + ' for ' + url); throw e; }
+      );
+    };
+  })();
+  // Wrap XHR
+  (function () {
+    const _open = XMLHttpRequest.prototype.open;
+    const _send = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (m, u, ...rest) {
+      this._gvUrl = u; this._gvMethod = m;
+      return _open.call(this, m, u, ...rest);
+    };
+    XMLHttpRequest.prototype.send = function (...args) {
+      const url = (this._gvUrl || '').toString();
+      // Log EVERY xhr — igv.js fetches reference data from external CDNs and
+      // hangs there are otherwise invisible. Truncate noisy URLs.
+      const short = url.length > 160 ? url.substring(0, 160) + '…' : url;
+      gvLogEntry('xhr -> ' + this._gvMethod + ' ' + short);
+      const safeSize = (xhr) => {
+        try {
+          // responseText throws if responseType is arraybuffer/blob/document.
+          if (xhr.responseType === '' || xhr.responseType === 'text') {
+            return (xhr.responseText || '').length;
+          }
+          if (xhr.response && typeof xhr.response.byteLength === 'number') {
+            return xhr.response.byteLength;
+          }
+          if (xhr.response && typeof xhr.response.size === 'number') {
+            return xhr.response.size;
+          }
+        } catch (_) { /* fall through */ }
+        return 0;
+      };
+      this.addEventListener('load', () => gvLogEntry('xhr <- ' + this.status + ' (' + safeSize(this) + 'b) ' + short));
+      this.addEventListener('error', () => gvLogEntry('xhr !! error ' + short));
+      this.addEventListener('timeout', () => gvLogEntry('xhr !! timeout ' + short));
+      this.addEventListener('abort', () => gvLogEntry('xhr !! abort ' + short));
+      return _send.apply(this, args);
+    };
+  })();
+
+  // Surface uncaught errors visibly so users don't sit watching a spinner
+  // when igv.js silently throws from inside an async callback.
+  window.addEventListener('error', (e) => {
+    console.error('[genome_viewer] window error:', e.message, e.error);
+    showErrorBanner('uncaught error: ' + e.message);
+  });
+  window.addEventListener('unhandledrejection', (e) => {
+    const r = e.reason;
+    const msg = (r && (r.message || r.toString())) || String(r);
+    console.error('[genome_viewer] unhandled rejection:', r);
+    showErrorBanner('unhandled rejection: ' + msg);
+  });
+
+  // Toast-like error banner. Shows at the bottom of the screen so the user
+  // sees track-load failures even if the file-browser modal was closed.
+  function showErrorBanner(message) {
+    const id = 'gv-error-banner';
+    let el = document.getElementById(id);
+    if (!el) {
+      el = document.createElement('div');
+      el.id = id;
+      el.style.cssText = 'position:fixed;bottom:16px;right:16px;max-width:520px;' +
+        'background:#dc3545;color:#fff;padding:10px 14px;border-radius:6px;' +
+        'font:13px monospace;z-index:9999;box-shadow:0 4px 12px rgba(0,0,0,0.25);' +
+        'cursor:pointer;white-space:pre-wrap;';
+      el.title = 'Click to dismiss';
+      el.addEventListener('click', () => el.remove());
+      document.body.appendChild(el);
+    }
+    el.textContent = '[genome_viewer] ' + message + '  (click to dismiss)';
+  }
+
   const FALLBACK_GENOMES = [
     { name: 'hg38', label: 'hg38 (Human)', chrom_sizes: null, default_locus: null, reference: {} },
     { name: 'hg19', label: 'hg19 (Human)', chrom_sizes: null, default_locus: null, reference: {} },
@@ -589,6 +720,17 @@
       if (reference.cytoband) definition.cytobandURL = toIgvUrl(reference.cytoband);
       if (reference.alias) definition.aliasURL = toIgvUrl(reference.alias);
       return definition;
+    }).filter((definition) => {
+      // Drop entries that carry only id/name and no actual reference URLs.
+      // Such "empty" entries crash igv.js 3.x's genome-merge with
+      // "Cannot read properties of undefined (reading 'startsWith')" when
+      // it tries to combine them with its built-in genomes.json. If the
+      // user wants to use a stock genome (hg38, hg19, etc.), `genome:` +
+      // `loadDefaultGenomes: true` already covers it without us listing
+      // the genome in genomeList.
+      return definition.fastaURL || definition.twoBitURL ||
+             definition.indexURL || definition.compressedIndexURL ||
+             definition.cytobandURL || definition.aliasURL;
     });
   }
 
@@ -630,6 +772,7 @@
   // ── Initialization ──────────────────────────────────────────────
 
   async function init() {
+    gvLogEntry('init: start');
     // Fetch server config to get allowed_roots and initial genome
     try {
       const resp = await apiFetch('/api/config');
@@ -642,17 +785,40 @@
     } catch (_) {
       // Server config is optional — igv.js can work standalone
     }
+    gvLogEntry('init: config loaded, genome=' + currentGenome);
 
     renderGenomeMenu();
     setActiveGenome(currentGenome);
 
     // Restore previous session if available (survives refresh / re-auth)
     const saved = popSavedSession();
-    if (saved) {
-      await createBrowser(null, saved);
-    } else {
-      await createBrowser(currentGenome);
+    gvLogEntry('init: createBrowser ' + (saved ? '(restoring session)' : '(fresh)'));
+
+    // Watchdog: if igv.createBrowser doesn't resolve in 20s, surface a banner
+    // so the user knows the genome init is what's hanging (not a track click).
+    const watchdog = setTimeout(() => {
+      const msg = 'igv.createBrowser is taking >20s — likely hanging on igv.js ' +
+        'reference data fetch (s3.amazonaws.com/igv.org.genomes). Check the ' +
+        '[debug] panel for the pending request.';
+      console.error('[genome_viewer]', msg);
+      showErrorBanner(msg);
+    }, 20000);
+
+    try {
+      if (saved) {
+        await createBrowser(null, saved);
+      } else {
+        await createBrowser(currentGenome);
+      }
+      gvLogEntry('init: createBrowser done');
+    } catch (e) {
+      gvLogEntry('init: createBrowser FAILED: ' + (e && e.message || e));
+      showErrorBanner('createBrowser failed: ' + (e && e.message || e));
+      console.error('[genome_viewer] createBrowser failed:', e);
+    } finally {
+      clearTimeout(watchdog);
     }
+
     setupMenuHandlers();
     setupKeyboardShortcuts();
     setupPubFigureHandlers();
@@ -701,28 +867,100 @@
 
   // ── Track loading helpers ───────────────────────────────────────
 
+  // Plain-gzipped text formats (BED/GTF/etc.) that are *not* bgzip+tabix
+  // indexed. igv.js can't random-access these, so we register them on the
+  // server (which decompresses + parses) and let igv.js query features via
+  // /api/tracks/{id}/query through a custom source.
+  const SERVER_PARSE_RE = /\.(bed|gtf|gff|gff3|bedgraph)(\.gz)?$/i;
+
   function inferIndexUrl(filePath) {
+    // Last-resort guess only for BAM/CRAM, which by convention always carry
+    // a sibling .bai/.crai. We prefer entry.index_path from the server when
+    // it's available — see serverPathToIgvTrack.
     const lower = filePath.toLowerCase();
     if (lower.endsWith('.bam')) return filePath + '.bai';
     if (lower.endsWith('.cram')) return filePath + '.crai';
-    if (lower.endsWith('.vcf.gz')) return filePath + '.tbi';
-    if (lower.endsWith('.bed.gz')) return filePath + '.tbi';
-    if (lower.endsWith('.gtf.gz')) return filePath + '.tbi';
-    if (lower.endsWith('.gff.gz')) return filePath + '.tbi';
-    if (lower.endsWith('.gff3.gz')) return filePath + '.tbi';
     return null;
   }
 
-  function serverPathToIgvTrack(entry) {
-    const url = '/api/data?path=' + encodeURIComponent(entry.path);
-    const config = {
-      url: url,
-      name: entry.name,
+  // Convert a server Feature ({chrom,start,end,label,strand,score,...}) into
+  // the shape igv.js expects ({chr,start,end,name,strand,score,...}).
+  function serverFeatureToIgv(f) {
+    const out = {
+      chr: f.chrom,
+      start: f.start,
+      end: f.end,
     };
-    if (entry.format) {
-      config.format = entry.format;
+    if (f.label) out.name = f.label;
+    if (f.strand) out.strand = f.strand;
+    if (f.score != null) out.score = f.score;
+    if (f.feature_type) out.type = f.feature_type;
+    return out;
+  }
+
+  /** Parse JSON body returned by /api/tracks/{id}/query into igv.js features. */
+  function parseTrackQueryResponse(body) {
+    let data;
+    try {
+      data = (typeof body === 'string') ? JSON.parse(body) : body;
+    } catch (e) {
+      console.error('genome_viewer: failed to parse /api/tracks/.../query body', e, body);
+      return [];
     }
-    const indexPath = inferIndexUrl(entry.path);
+    const feats = (data && Array.isArray(data.features)) ? data.features : [];
+    return feats.map(serverFeatureToIgv);
+  }
+
+  /** Register a server-side text track and return an igv.js custom-source config. */
+  async function registerServerTextTrack(entry) {
+    const resp = await apiFetch('/api/tracks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: entry.path, name: entry.name }),
+    });
+    if (!resp.ok) {
+      const msg = await resp.text().catch(() => '');
+      throw new Error('register track failed (' + resp.status + '): ' + msg);
+    }
+    const reg = await resp.json();
+    const queryUrl = '/api/tracks/' + encodeURIComponent(reg.id) +
+      '/query?chrom=$CHR&start=$START&end=$END&limit=5000';
+    return {
+      name: entry.name,
+      type: 'annotation',
+      format: reg.kind,
+      sourceType: 'custom',
+      source: {
+        url: queryUrl,
+        method: 'GET',
+        parser: parseTrackQueryResponse,
+      },
+    };
+  }
+
+  /** Build an igv.js track config for a /api/files entry. Async because some
+   *  formats (plain-gzipped BED/GTF) need a server-side registration first. */
+  async function serverPathToIgvTrack(entry) {
+    const lowerName = (entry.name || entry.path || '').toLowerCase();
+    // Server-confirmed index path takes precedence over guesses.
+    const indexPath = entry.index_path || inferIndexUrl(entry.path);
+
+    // For text feature formats with no Tabix index, parse server-side. This
+    // covers `peaks.bed`, `peaks.bed.gz`, `genes.gtf.gz`, etc. — including
+    // plain (non-bgzip) gzip, which igv.js can't decompress on its own.
+    if (!indexPath && SERVER_PARSE_RE.test(lowerName)) {
+      try {
+        return await registerServerTextTrack(entry);
+      } catch (e) {
+        console.warn('genome_viewer: server-side registration failed, ' +
+                     'falling back to direct URL: ' + e.message);
+        // fall through to direct URL below
+      }
+    }
+
+    const dataUrl = '/api/data?path=' + encodeURIComponent(entry.path);
+    const config = { url: dataUrl, name: entry.name };
+    if (entry.format) config.format = entry.format;
     if (indexPath) {
       config.indexURL = '/api/data?path=' + encodeURIComponent(indexPath);
     }
@@ -845,12 +1083,19 @@
               statusEl.textContent = 'Index files are loaded automatically with their data files.';
               return;
             }
-            const trackConfig = serverPathToIgvTrack(entry);
+            statusEl.textContent = 'Loading: ' + entry.name + '...';
+            console.log('[genome_viewer] click', entry);
             try {
+              const trackConfig = await serverPathToIgvTrack(entry);
+              console.log('[genome_viewer] track config:', trackConfig);
               await browser.loadTrackList([trackConfig]);
               statusEl.textContent = 'Loaded: ' + entry.name;
+              console.log('[genome_viewer] loaded:', entry.name);
             } catch (err) {
-              statusEl.textContent = 'Error loading track: ' + err.message;
+              const msg = (err && err.message) || String(err);
+              statusEl.textContent = 'Error loading track: ' + msg;
+              showErrorBanner('track load failed: ' + msg);
+              console.error('[genome_viewer] track load failed:', err);
             }
           });
         }
