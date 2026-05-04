@@ -3,7 +3,7 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -347,7 +347,7 @@ pub fn read_source_to_string(source: &str) -> Result<String> {
     let mut output = String::new();
 
     if source.ends_with(".gz") {
-        let mut decoder = GzDecoder::new(bytes.as_slice());
+        let mut decoder = MultiGzDecoder::new(bytes.as_slice());
         decoder
             .read_to_string(&mut output)
             .with_context(|| format!("failed to decompress '{}'", source))?;
@@ -367,11 +367,59 @@ pub fn read_source_to_string(source: &str) -> Result<String> {
     Ok(output)
 }
 
+/// Decompress a gzip (or bgzip / multi-member gzip) byte slice into a fresh
+/// buffer. The decompressed size is capped at [`MAX_SOURCE_BYTES`] to guard
+/// against gzip bombs.
+pub fn decompress_gzip_bytes(bytes: &[u8], source_label: &str) -> Result<Vec<u8>> {
+    let mut decoder = MultiGzDecoder::new(bytes);
+    let mut output = Vec::new();
+    decoder
+        .read_to_end(&mut output)
+        .with_context(|| format!("failed to decompress '{}'", source_label))?;
+    if output.len() as u64 > MAX_SOURCE_BYTES {
+        bail!(
+            "decompressed source '{}' exceeds size limit ({} bytes, limit {})",
+            source_label,
+            output.len(),
+            MAX_SOURCE_BYTES
+        );
+    }
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        GenomeConfig, ReferenceConfig, build_config, load_chrom_sizes, normalize_local_path,
+        GenomeConfig, ReferenceConfig, build_config, decompress_gzip_bytes, load_chrom_sizes,
+        normalize_local_path,
     };
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    #[test]
+    fn decompress_gzip_bytes_round_trip_plain_gzip() {
+        let payload = b"chr1\t100\t200\tpeak\n";
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(payload).unwrap();
+        let gz = encoder.finish().unwrap();
+        let out = decompress_gzip_bytes(&gz, "test.bed.gz").unwrap();
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn decompress_gzip_bytes_handles_multi_member_bgzip_like() {
+        // bgzip is just multiple gzip members concatenated. Verify
+        // MultiGzDecoder reads past the first member instead of stopping.
+        let mut combined = Vec::new();
+        for chunk in [b"first\n".as_ref(), b"second\n".as_ref()] {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(chunk).unwrap();
+            combined.extend(encoder.finish().unwrap());
+        }
+        let out = decompress_gzip_bytes(&combined, "test.bgzip").unwrap();
+        assert_eq!(out, b"first\nsecond\n");
+    }
 
     #[test]
     fn parse_chrom_sizes_text() {

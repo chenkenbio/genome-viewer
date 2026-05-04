@@ -110,6 +110,11 @@ pub struct FileBrowserEntry {
     pub is_dir: bool,
     pub size: Option<u64>,
     pub format: Option<String>,
+    /// Path to a sibling index file (`.tbi`, `.csi`, `.bai`, `.crai`, `.idx`)
+    /// if one exists on disk. `None` means no index was found, which the
+    /// frontend uses to decide whether to load `.bed.gz`/`.gtf.gz` etc. via
+    /// the server-side decompressor instead of as a Tabix-indexed file.
+    pub index_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

@@ -18,8 +18,8 @@ use tower_http::services::ServeFile;
 
 use crate::config::{
     GenomeConfig, ReferenceConfig, ResolvedConfig, TrackConfig, TrackKind, build_config,
-    default_chrom_sizes_url, expand_path, is_remote_path, load_input_config, load_user_config,
-    normalize_local_path,
+    decompress_gzip_bytes, default_chrom_sizes_url, expand_path, is_remote_path,
+    load_input_config, load_user_config, normalize_local_path,
 };
 use crate::model::{
     AddTrackRequest, ApiConfigResponse, ApiGenomeReferenceResponse, ApiGenomeResponse,
@@ -154,6 +154,11 @@ struct FileListQuery {
 #[derive(Debug, serde::Deserialize)]
 struct DataQuery {
     path: String,
+    /// When set to `1`/`true`, decompress a `*.gz` file on the fly and serve
+    /// the decompressed bytes. Used for plain-gzipped BED/GTF/etc. that are
+    /// not bgzip+tabix indexed (igv.js cannot handle those directly).
+    #[serde(default)]
+    decompress: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -485,13 +490,14 @@ async fn list_files(
         if !is_dir && !is_genomic_file(&name) {
             continue;
         }
-        let (size, format) = if is_dir {
-            (None, None)
+        let (size, format, index_path) = if is_dir {
+            (None, None, None)
         } else {
             let meta = item.metadata().ok();
             let file_size = meta.map(|m| m.len());
             let fmt = igvjs_format(&name).map(String::from);
-            (file_size, fmt)
+            let idx = find_sibling_index(&path);
+            (file_size, fmt, idx)
         };
         entries.push(FileBrowserEntry {
             name,
@@ -499,6 +505,7 @@ async fn list_files(
             is_dir,
             size,
             format,
+            index_path,
         });
     }
 
@@ -533,11 +540,52 @@ async fn serve_data(
             path.display()
         )));
     }
+
+    if is_truthy(query.decompress.as_deref()) {
+        let lower_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        if !lower_name.ends_with(".gz") {
+            return Err(AppError::bad_request(
+                "decompress=1 only valid for .gz files",
+            ));
+        }
+        let path_for_blocking = path.clone();
+        let decompressed = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+            let bytes = std::fs::read(&path_for_blocking).with_context(|| {
+                format!("failed to read '{}'", path_for_blocking.display())
+            })?;
+            decompress_gzip_bytes(&bytes, &path_for_blocking.display().to_string())
+        })
+        .await
+        .map_err(|err| AppError::from(anyhow!("decompression task failed: {}", err)))??;
+
+        let mut response = (StatusCode::OK, decompressed).into_response();
+        let headers = response.headers_mut();
+        headers.insert(
+            header::CONTENT_TYPE,
+            "text/plain; charset=utf-8".parse().unwrap(),
+        );
+        // Decompressed payload is generated per-request; don't let intermediaries
+        // cache a stale rendering, and don't advertise byte-range support.
+        headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+        headers.insert(header::ACCEPT_RANGES, "none".parse().unwrap());
+        return Ok(response);
+    }
+
     let response = ServeFile::new(&path)
         .oneshot(request)
         .await
         .map_err(|err| AppError::from(anyhow!("failed to serve file: {}", err)))?;
     Ok(response.into_response())
+}
+
+fn is_truthy(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::to_ascii_lowercase).as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
 }
 
 async fn add_track(
@@ -888,6 +936,53 @@ fn is_within_allowed_roots(roots: &[PathBuf], path: &FsPath) -> bool {
     roots.iter().any(|root| path.starts_with(root))
 }
 
+/// Look next to a data file for a Tabix/BAM/CRAM/IDX style index. Returns the
+/// path of the first index found that actually exists on disk, or `None` if
+/// no sibling index is present.
+///
+/// Conventions checked:
+///   `foo.bam`        → `foo.bam.bai` or `foo.bai`
+///   `foo.cram`       → `foo.cram.crai` or `foo.crai`
+///   `foo.bed.gz`     → `foo.bed.gz.tbi` or `foo.bed.gz.csi`
+///   `foo.vcf.gz`     → `foo.vcf.gz.tbi` or `foo.vcf.gz.csi`
+///   `foo.gtf.gz`     → `foo.gtf.gz.tbi` or `foo.gtf.gz.csi`
+fn find_sibling_index(path: &FsPath) -> Option<String> {
+    let lower = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let candidates: &[&str] = if lower.ends_with(".bam") {
+        &[".bai"]
+    } else if lower.ends_with(".cram") {
+        &[".crai"]
+    } else if lower.ends_with(".gz") {
+        &[".tbi", ".csi"]
+    } else {
+        &[]
+    };
+
+    let parent = path.parent()?;
+    let stem = path.file_name()?.to_string_lossy().into_owned();
+
+    for ext in candidates {
+        // Try `<full>.<ext>` (e.g. `foo.bam.bai`, `foo.bed.gz.tbi`)
+        let with_full = parent.join(format!("{}{}", stem, ext));
+        if with_full.exists() {
+            return Some(with_full.display().to_string());
+        }
+        // Try `<stem-without-final-ext>.<ext>` (e.g. `foo.bai`)
+        if let Some(dot_pos) = stem.rfind('.') {
+            let trimmed = &stem[..dot_pos];
+            let alt = parent.join(format!("{}{}", trimmed, ext));
+            if alt.exists() {
+                return Some(alt.display().to_string());
+            }
+        }
+    }
+    None
+}
+
 fn unique_track_id(state: &AppState, seed: &str) -> String {
     let base = slugify(seed);
     let tracks = state.tracks.read().expect("tracks lock");
@@ -937,8 +1032,13 @@ fn default_track_name(source: &str, kind: &TrackKind) -> String {
 const INDEX_HTML: &str = include_str!("../static/index.html");
 
 async fn serve_index() -> impl IntoResponse {
+    // `Cache-Control: no-store` so users picking up a new server build don't
+    // get stuck on a cached old SPA (which would still issue old API calls).
     (
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
         INDEX_HTML,
     )
 }
@@ -1158,7 +1258,8 @@ const LOGIN_PAGE_ERROR: &str = r#"<!doctype html>
 #[cfg(test)]
 mod tests {
     use super::{
-        PortSelection, is_within_allowed_roots, parse_port_spec, resolve_port_selection, slugify,
+        PortSelection, find_sibling_index, is_truthy, is_within_allowed_roots, parse_port_spec,
+        resolve_port_selection, slugify,
     };
     use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
@@ -1226,5 +1327,61 @@ mod tests {
                 end: 52_010,
             }
         );
+    }
+
+    #[test]
+    fn is_truthy_recognizes_common_values() {
+        assert!(is_truthy(Some("1")));
+        assert!(is_truthy(Some("true")));
+        assert!(is_truthy(Some("YES")));
+        assert!(!is_truthy(Some("0")));
+        assert!(!is_truthy(Some("")));
+        assert!(!is_truthy(None));
+    }
+
+    #[test]
+    fn find_sibling_index_finds_tabix_for_bed_gz() {
+        let dir = make_test_dir("idx_bedgz");
+        let bed = dir.join("peaks.bed.gz");
+        std::fs::write(&bed, b"").unwrap();
+        // Without an index, returns None.
+        assert!(find_sibling_index(&bed).is_none());
+
+        // With a `.tbi` sibling, returns its path.
+        let tbi = dir.join("peaks.bed.gz.tbi");
+        std::fs::write(&tbi, b"").unwrap();
+        assert_eq!(
+            find_sibling_index(&bed).unwrap(),
+            tbi.display().to_string()
+        );
+    }
+
+    #[test]
+    fn find_sibling_index_handles_bam_alt_index() {
+        let dir = make_test_dir("idx_bam");
+        let bam = dir.join("aln.bam");
+        std::fs::write(&bam, b"").unwrap();
+        // Try the alternate naming `aln.bai` (without `.bam` in the index name).
+        let bai = dir.join("aln.bai");
+        std::fs::write(&bai, b"").unwrap();
+        assert_eq!(
+            find_sibling_index(&bam).unwrap(),
+            bai.display().to_string()
+        );
+    }
+
+    fn make_test_dir(stem: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "genome_viewer_test_{}_{}_{}",
+            stem,
+            std::process::id(),
+            unique
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }
