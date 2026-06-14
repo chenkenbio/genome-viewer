@@ -2,7 +2,7 @@
 
 `genome_viewer` is a single-binary Rust web server for browsing genomic tracks in the browser with [igv.js](https://github.com/igvteam/igv.js). It is built for the common bioinformatics case where the data lives on a workstation, lab server, or shared filesystem and you want a browser UI without setting up a separate web stack.
 
-It serves a small embedded frontend, queries BigWig and BigBed server-side, preloads BED and GTF text tracks, and exposes a constrained file browser for loading local tracks at runtime.
+It serves a small embedded frontend, queries BigWig, BigBed, and base-resolution HDF5 signal tracks server-side, preloads BED and GTF text tracks, and exposes a constrained file browser for loading local tracks at runtime.
 
 ## Why this exists
 
@@ -12,7 +12,7 @@ It serves a small embedded frontend, queries BigWig and BigBed server-side, prel
 
 - Single binary, no Node.js, no Java, no separate static asset deployment.
 - Zero-config startup for common genomes such as `hg38` and `mm10`.
-- Server-side BigWig/BigBed range queries, so the browser receives compact JSON instead of parsing binary formats itself.
+- Server-side BigWig/BigBed/HDF5 range queries, so the browser receives compact JSON instead of parsing binary formats itself.
 - Built-in file browser for loading tracks from allowed local directories.
 - Token authentication enabled by default.
 - Publication-oriented figure export directly from the browser.
@@ -22,6 +22,7 @@ It serves a small embedded frontend, queries BigWig and BigBed server-side, prel
 - **Embedded frontend**: `static/index.html` is compiled into the binary, so deployment is just the executable.
 - **Layered configuration**: CLI flags, optional JSON config, optional user config, and UCSC chromosome-size fallback.
 - **Track management at runtime**: add, remove, and reorder server-managed tracks through the API.
+- **Base-resolution HDF5 signal support**: load local seedat `BigWigH5` files (`.h5` / `.hdf5`) as queryable signal tracks.
 - **Practical browser workflow**: load server files, load remote URLs, save/load sessions, save SVG/PNG, and preserve session state across refresh and re-authentication.
 - **Security-minded local file access**: local paths are restricted to canonicalized `allowed_roots`; remote URLs are supported read-only.
 
@@ -217,11 +218,23 @@ These are exposed through `/api/tracks/{id}/query`:
 | Format | Extensions | Behavior |
 |--------|------------|----------|
 | BigWig | `.bw`, `.bigwig` | On-demand query with binning and window functions |
+| HDF5 signal | `.h5`, `.hdf5` | On-demand query for local base-resolution seedat `BigWigH5` files |
 | BigBed | `.bb`, `.bigbed` | On-demand indexed feature query |
 | BED | `.bed`, `.bed.gz` | Preloaded into memory at startup or add time |
 | GTF | `.gtf`, `.gtf.gz` | Preloaded into memory with 1-based to 0-based conversion |
 
 Both plain `gzip` and multi-member `bgzip` are accepted for `.bed.gz` / `.gtf.gz`, decoded with `flate2`'s `MultiGzDecoder` (single-member `gzip` would silently truncate bgzipped files).
+
+HDF5 signal support expects the seedat `BigWigH5` base-resolution layout:
+
+- local files only; remote HTTP-range HDF5 is not supported
+- one 1-D dataset per chromosome at the HDF5 file root
+- dataset name equals the chromosome name, with `chr` prefix fallback (`chr1` ↔ `1`)
+- index `i` is 0-based genomic position `i`
+- element type is `float16`, `float32`, or `float64`
+- `NaN` means no coverage and is skipped during aggregation
+
+The binned `LowResBigWigH5` layout is rejected for now. For small zoom windows, the server caps emitted bins to the query span, so a 219 bp window can return 219 one-base signal bins instead of averaged coarse bins. The browser HDF5 loader disables igv.js query expansion, feature-cache reuse, and client-side wig summarization for these custom tracks so values are not averaged a second time after zooming.
 
 Supported BigWig window functions:
 
@@ -245,9 +258,12 @@ The built-in file browser also exposes these igv.js-compatible formats as raw fi
 - WIG
 - BedGraph
 - SEG
+- local HDF5 signal files (`.h5`, `.hdf5`) through server-side registration
 - common index files such as `.bai`, `.crai`, `.tbi`, `.csi`, `.idx`
 
-For plain-gzipped (non-bgzip) text formats (`.bed.gz`, `.gtf.gz`, `.gff.gz`, `.gff3.gz`, `.bedgraph.gz`), clicking the file in the browser auto-registers it through `POST /api/tracks` and serves features via the server-side query endpoint with an igv.js custom source. This avoids igv.js's bgzip+tabix assumption that would otherwise require a `.tbi` sibling. When the server actually finds a real `.tbi`/`.csi`/`.bai`/`.crai` next to the data file, the file browser uses igv.js's native indexed loader instead.
+For plain-gzipped (non-bgzip) BED/GTF files (`.bed.gz`, `.gtf.gz`), clicking the file in the browser auto-registers it through `POST /api/tracks` and serves features via the server-side query endpoint with an igv.js custom source. This avoids igv.js's bgzip+tabix assumption that would otherwise require a `.tbi` sibling. When the server actually finds a real `.tbi`/`.csi`/`.bai`/`.crai` next to the data file, the file browser uses igv.js's native indexed loader instead.
+
+For `.h5` / `.hdf5` files, the browser registers the file as a server-side HDF5 signal track. HDF5 files are not served directly to igv.js as raw data.
 
 ## Browser workflow
 
@@ -306,6 +322,19 @@ curl -X POST http://localhost:<port>/api/tracks \
 
 `kind` is optional if it can be inferred from the source extension.
 
+HDF5 signal tracks can be added the same way:
+
+```bash
+curl -X POST http://localhost:<port>/api/tracks \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer YOUR_TOKEN' \
+  -d '{
+    "source": "/data/tracks/sample.bw.h5",
+    "name": "Sample HDF5 signal",
+    "kind": "hdf5"
+  }'
+```
+
 ### Query a track
 
 ```bash
@@ -318,7 +347,7 @@ Query parameters:
 - `chrom` required
 - `start` required, 0-based
 - `end` required, 0-based exclusive
-- `bins` optional, default `800` for BigWig
+- `bins` optional, default `800` for BigWig and HDF5 signal tracks; capped to `4000` and never more than the requested span
 - `limit` optional, default `2000` for feature tracks
 - `window_function` optional, default `mean`
 
@@ -329,6 +358,7 @@ The publication figure workflow renders a separate SVG, then optionally rasteriz
 Current figure support includes:
 
 - BigWig signal area plots
+- HDF5 signal area plots
 - BED / BigBed interval tracks
 - GTF gene models with exons, UTR/CDS structure, intron lines, strand arrows, and labels
 - coordinate axis
@@ -395,13 +425,15 @@ The project is intentionally small:
 - `src/main.rs`: CLI, Axum router, handlers, auth middleware, runtime state
 - `src/config.rs`: config loading, path normalization, chromosome-size loading, safe source reading
 - `src/model.rs`: API request/response types
-- `src/tracks.rs`: format inference, text-track parsing, BigWig/BigBed query logic
+- `src/tracks.rs`: format inference, text-track parsing, BigWig/BigBed/HDF5 query logic
 - `static/index.html`: single-file frontend UI
 
 Key implementation details:
 
 - BigWig and BigBed access is synchronous in `bigtools`, so queries run in `spawn_blocking`.
+- HDF5 signal access is also blocking and runs in `spawn_blocking`; reads are slabbed to bound peak memory use and folded into the same signal-bin aggregation path as BigWig.
 - BED and GTF tracks are parsed into in-memory per-chromosome vectors and queried by binary-search-like partitioning.
+- HDF5 `NaN` values are treated as absent coverage, matching BigWig empty-interval behavior.
 - Gzip / bgzip decoding uses `flate2::read::MultiGzDecoder`, so multi-member bgzip streams are fully decoded instead of silently truncated at the first member.
 - The file browser populates each entry's `index_path` by probing the filesystem for the real sibling index (`.tbi`/`.csi`/`.bai`/`.crai`) rather than guessing by convention; this lets the SPA decide between igv.js's indexed loader and server-side parsing without 404 round-trips.
 - Internal server errors are logged server-side and returned as a generic `internal server error` message to the client.
