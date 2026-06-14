@@ -502,7 +502,7 @@
 
   // Build tag, visible in the navbar — proves which version of the SPA the
   // browser actually loaded (cache-busting check).
-  const BUILD_TAG = 'gv-build-2026-06-14-igv-default-reference';
+  const BUILD_TAG = 'gv-build-2026-06-14-igv-default-reference-v2';
   console.log('[genome_viewer] build:', BUILD_TAG);
   document.addEventListener('DOMContentLoaded', () => {
     const nav = document.querySelector('.navbar-igv') || document.body;
@@ -828,6 +828,28 @@
     return (IGV_DEFAULT_GENE_TRACKS[genomeName] || []).map((track) => ({ ...track }));
   }
 
+  function isServerChromSizesReference(reference) {
+    if (!reference || reference.format !== 'chromsizes') return false;
+    const url = reference.url || reference.fastaURL || '';
+    return /\/api\/chromsizes\?genome=/i.test(String(url));
+  }
+
+  function ensureDefaultGeneTracks(options, genomeName) {
+    if (!options) return;
+    const defaults = cloneDefaultGeneTracks(genomeName);
+    if (defaults.length === 0) return;
+    if (!Array.isArray(options.tracks)) options.tracks = [];
+
+    for (const defaultTrack of defaults) {
+      const exists = options.tracks.some((track) => {
+        if (!track) return false;
+        if (defaultTrack.id && track.id === defaultTrack.id) return true;
+        return defaultTrack.url && track.url === defaultTrack.url;
+      });
+      if (!exists) options.tracks.push(defaultTrack);
+    }
+  }
+
   function locusToString(locus) {
     if (!locus || !locus.chrom) return null;
     const start = Number(locus.start || 0) + 1;
@@ -953,6 +975,19 @@
     return options;
   }
 
+  function upgradeBrowserSession(options) {
+    if (!options) return options;
+    upgradeServerSignalSession(options);
+
+    const genomeName = activeGenomeIdFromOptions(options) || currentGenome;
+    if (isServerChromSizesReference(options.reference) && IGV_DEFAULT_REFERENCES[genomeName]) {
+      delete options.reference;
+      options.genome = genomeName;
+    }
+    ensureDefaultGeneTracks(options, genomeName);
+    return options;
+  }
+
   function setActiveGenome(genomeName) {
     const genome = findGenomeConfig(genomeName);
     currentGenome = genomeName || currentGenome;
@@ -1041,7 +1076,7 @@
   async function createBrowser(genome, sessionOptions) {
     const container = document.getElementById('igv-container');
     container.innerHTML = '';
-    upgradeServerSignalSession(sessionOptions);
+    upgradeBrowserSession(sessionOptions);
 
     const genomeName = activeGenomeIdFromOptions(sessionOptions) || genome || currentGenome;
     const genomeConfig = findGenomeConfig(genomeName);
