@@ -22,6 +22,7 @@ It serves a small embedded frontend, queries BigWig, BigBed, and base-resolution
 - **Embedded frontend**: `static/index.html` is compiled into the binary, so deployment is just the executable.
 - **Layered configuration**: CLI flags, optional JSON config, optional user config, and UCSC chromosome-size fallback.
 - **Track management at runtime**: add, remove, and reorder server-managed tracks through the API.
+- **IGV-style default context**: known genomes open with reference sequence support and a default RefSeq gene annotation track.
 - **Base-resolution HDF5 signal support**: load local seedat `BigWigH5` files (`.h5` / `.hdf5`) as queryable signal tracks.
 - **Practical browser workflow**: load server files, load remote URLs, save/load sessions, save SVG/PNG, and preserve session state across refresh and re-authentication.
 - **Security-minded local file access**: local paths are restricted to canonicalized `allowed_roots`; remote URLs are supported read-only.
@@ -58,6 +59,7 @@ Default behavior:
 
 - Binds to `0.0.0.0` and picks a random free port in `50000-60000`
 - Uses genome `hg38`
+- Shows IGV-style reference sequence and a default RefSeq gene track for known genomes (`hg38`, `hg19`, `mm39`, `mm10`, `dm6`, `sacCer3`, `ce11`)
 - Enables token auth unless `--no-token` is set
 - Includes the current working directory as an allowed root unless `--no-cwd` is set
 
@@ -94,6 +96,8 @@ That config demonstrates:
 | `--no-cwd` | Do not add the current directory to allowed roots. |
 | `--allow-symlink` | Allow symlinks located inside allowed roots to target files outside allowed roots. |
 | `--title <text>` | Viewer title. |
+
+By default, symlinks are resolved before path access is allowed. If a file path is inside an allowed root but resolves to a target outside those roots, `/api/data` and related endpoints return `400 symbolic link not allowed ... restart with --allow-symlink ...`.
 
 ## Configuration
 

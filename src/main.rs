@@ -1051,6 +1051,14 @@ fn validate_local_path(
         AppError::bad_request(format!("cannot resolve path '{}': {}", path.display(), e))
     })?;
     if !is_within_allowed_roots(allowed_roots, &canonical) {
+        if is_within_allowed_roots(allowed_roots, &path) {
+            return Err(AppError::bad_request(format!(
+                "symbolic link not allowed: path '{}' resolves to '{}' outside allowed roots; \
+                 restart with --allow-symlink to allow symlink targets outside allowed roots",
+                path.display(),
+                canonical.display()
+            )));
+        }
         return Err(AppError::bad_request(format!(
             "path '{}' is outside allowed roots",
             path.display()
@@ -1425,6 +1433,8 @@ mod tests {
         let roots = vec![std::fs::canonicalize(allowed_dir.path()).unwrap()];
         let err = validate_local_path(link.to_str().unwrap(), &roots, false).unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("symbolic link not allowed"));
+        assert!(err.message.contains("--allow-symlink"));
         assert!(err.message.contains("outside allowed roots"));
 
         let accepted = validate_local_path(link.to_str().unwrap(), &roots, true).unwrap();

@@ -502,7 +502,7 @@
 
   // Build tag, visible in the navbar — proves which version of the SPA the
   // browser actually loaded (cache-busting check).
-  const BUILD_TAG = 'gv-build-2026-06-13-hdf5-resolution-v2';
+  const BUILD_TAG = 'gv-build-2026-06-14-igv-default-reference';
   console.log('[genome_viewer] build:', BUILD_TAG);
   document.addEventListener('DOMContentLoaded', () => {
     const nav = document.querySelector('.navbar-igv') || document.body;
@@ -641,6 +641,130 @@
     { name: 'ce11', label: 'ce11 (C. elegans)', chrom_sizes: null, default_locus: null, reference: {} },
   ];
 
+  // Mirrored from https://igv.org/genomes/genomes.json for the built-in
+  // genomes. We keep loadDefaultGenomes=false and provide these directly so
+  // startup does not depend on fetching the hosted registry.
+  const IGV_DEFAULT_REFERENCES = {
+    hg38: {
+      fastaURL: 'https://igv.org/genomes/data/hg38/hg38.fa',
+      indexURL: 'https://igv.org/genomes/data/hg38/hg38.fa.fai',
+      twoBitURL: 'https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.2bit',
+      cytobandURL: 'https://hgdownload.soe.ucsc.edu/goldenPath/hg38/database/cytoBandIdeo.txt.gz',
+      aliasURL: 'https://igv.org/data/hg38/hg38_alias.tab',
+      wholeGenomeView: true,
+    },
+    hg19: {
+      fastaURL: 'https://igv.org/genomes/data/hg19/hg19.fasta',
+      indexURL: 'https://igv.org/genomes/data/hg19/hg19.fasta.fai',
+      twoBitURL: 'https://hgdownload.soe.ucsc.edu/goldenPath/hg19/bigZips/hg19.2bit',
+      cytobandURL: 'https://hgdownload.soe.ucsc.edu/goldenPath/hg19/database/cytoBand.txt.gz',
+      aliasURL: 'https://igv.org/data/hg19/hg19_alias.tab',
+      wholeGenomeView: true,
+    },
+    mm39: {
+      twoBitURL: 'https://hgdownload.soe.ucsc.edu/goldenPath/mm39/bigZips/mm39.2bit',
+      cytobandURL: 'https://hgdownload.soe.ucsc.edu/goldenPath/mm39/database/cytoBandIdeo.txt.gz',
+      aliasURL: 'https://hgdownload.soe.ucsc.edu/goldenPath/mm39/bigZips/mm39.chromAlias.txt',
+      wholeGenomeView: true,
+    },
+    mm10: {
+      fastaURL: 'https://igv.org/genomes/data/mm10/mm10.fa',
+      indexURL: 'https://igv.org/genomes/data/mm10/mm10.fa.fai',
+      twoBitURL: 'https://hgdownload.soe.ucsc.edu/goldenPath/mm10/bigZips/mm10.2bit',
+      cytobandURL: 'https://hgdownload.soe.ucsc.edu/goldenPath/mm10/database/cytoBand.txt.gz',
+      aliasURL: 'https://hgdownload.soe.ucsc.edu/hubs/GCF/000/001/635/GCF_000001635.26/GCF_000001635.26.chromAlias.txt',
+      wholeGenomeView: true,
+    },
+    dm6: {
+      fastaURL: 'https://igv.org/genomes/data/ce11/dm6.fa',
+      indexURL: 'https://igv.org/genomes/data/ce11/dm6.fa.fai',
+      twoBitURL: 'https://hgdownload.soe.ucsc.edu/goldenPath/dm6/bigZips/dm6.2bit',
+      cytobandURL: 'https://hgdownload.soe.ucsc.edu/goldenPath/dm6/database/cytoBandIdeo.txt.gz',
+      aliasURL: 'https://hgdownload.soe.ucsc.edu/goldenPath/dm6/bigZips/dm6.chromAlias.txt',
+      wholeGenomeView: true,
+    },
+    sacCer3: {
+      fastaURL: 'https://igv.org/genomes/data/sacCer3/sacCer3.fa',
+      indexURL: 'https://igv.org/genomes/data/sacCer3/sacCer3.fa.fai',
+      twoBitURL: 'https://hgdownload.soe.ucsc.edu/hubs/GCF/000/146/045/GCF_000146045.2/GCF_000146045.2.2bit',
+      twoBitBptURL: 'https://hgdownload.soe.ucsc.edu/hubs/GCF/000/146/045/GCF_000146045.2/GCF_000146045.2.2bit.bpt',
+      chromAliasBbURL: 'https://hgdownload.soe.ucsc.edu/hubs/GCF/000/146/045/GCF_000146045.2/GCF_000146045.2.chromAlias.bb',
+      cytobandBbURL: 'https://hgdownload.soe.ucsc.edu/hubs/GCF/000/146/045/GCF_000146045.2/bbi/GCF_000146045.2_R64.cytoBand.bb',
+      wholeGenomeView: true,
+    },
+    ce11: {
+      fastaURL: 'https://igv.org/genomes/data/ce11/ce11.fa',
+      indexURL: 'https://igv.org/genomes/data/ce11/ce11.fa.fai',
+      twoBitURL: 'https://hgdownload.soe.ucsc.edu/goldenPath/ce11/bigZips/ce11.2bit',
+      cytobandURL: 'https://hgdownload.soe.ucsc.edu/goldenPath/ce11/database/cytoBandIdeo.txt.gz',
+      aliasURL: 'https://hgdownload.soe.ucsc.edu/goldenPath/ce11/bigZips/ce11.chromAlias.txt',
+      wholeGenomeView: true,
+    },
+  };
+
+  const IGV_DEFAULT_GENE_TRACKS = {
+    hg38: [{
+      id: 'refseqAll',
+      name: 'Refseq All',
+      url: 'https://hgdownload.soe.ucsc.edu/goldenPath/hg38/database/ncbiRefSeq.txt.gz',
+      format: 'refgene',
+      html: 'https://www.ncbi.nlm.nih.gov/refseq/',
+      infoURL: 'https://www.ncbi.nlm.nih.gov/gene/?term=$$',
+      order: 100000,
+    }],
+    hg19: [{
+      id: 'refseqAll',
+      name: 'Refseq All',
+      url: 'https://hgdownload.soe.ucsc.edu/goldenPath/hg19/database/ncbiRefSeq.txt.gz',
+      format: 'refgene',
+      html: 'https://www.ncbi.nlm.nih.gov/refseq/',
+      order: 100000,
+    }],
+    mm39: [{
+      id: 'refseqCurated',
+      name: 'Refseq Curated',
+      url: 'https://hgdownload.soe.ucsc.edu/goldenPath/mm39/database/ncbiRefSeqCurated.txt.gz',
+      format: 'refgene',
+      displayMode: 'COLLAPSED',
+      html: 'https://www.ncbi.nlm.nih.gov/refseq/refseq_select/',
+      order: 100000,
+    }],
+    mm10: [{
+      id: 'ncbiRefSeq',
+      name: 'RefSeq All',
+      url: 'https://hgdownload.soe.ucsc.edu/goldenPath/mm10/database/ncbiRefSeq.txt.gz',
+      format: 'refgene',
+      color: 'rgb(12,12,120)',
+      order: 100000,
+    }],
+    dm6: [{
+      id: 'refseqCurated',
+      name: 'Refseq Curated',
+      url: 'https://hgdownload.soe.ucsc.edu/goldenPath/dm6/database/ncbiRefSeqCurated.txt.gz',
+      format: 'refgene',
+      displayMode: 'COLLAPSED',
+      html: 'https://www.ncbi.nlm.nih.gov/refseq/refseq_select/',
+      order: 100000,
+    }],
+    sacCer3: [{
+      id: 'refseqAll',
+      name: 'Refseq All',
+      url: 'https://hgdownload.soe.ucsc.edu/goldenPath/sacCer3/database/ncbiRefSeq.txt.gz',
+      format: 'refgene',
+      displayMode: 'COLLAPSED',
+      html: 'https://www.ncbi.nlm.nih.gov/refseq/refseq_select/',
+      order: 100000,
+    }],
+    ce11: [{
+      id: 'refseqCurated',
+      name: 'Refseq Curated',
+      url: 'https://hgdownload.soe.ucsc.edu/goldenPath/ce11/database/ncbiRefSeqCurated.txt.gz',
+      format: 'refgene',
+      html: 'https://www.ncbi.nlm.nih.gov/refseq/refseq_select/',
+      order: 100000,
+    }],
+  };
+
   let browser = null;
   let currentGenome = 'hg38';
   let serverConfig = null;
@@ -696,6 +820,14 @@
     return isRemoteUrl(value) ? value : '/api/data?path=' + encodeURIComponent(value);
   }
 
+  function hasConfiguredSequenceReference(reference) {
+    return Boolean(reference && (reference.fasta || reference.twobit));
+  }
+
+  function cloneDefaultGeneTracks(genomeName) {
+    return (IGV_DEFAULT_GENE_TRACKS[genomeName] || []).map((track) => ({ ...track }));
+  }
+
   function locusToString(locus) {
     if (!locus || !locus.chrom) return null;
     const start = Number(locus.start || 0) + 1;
@@ -724,26 +856,63 @@
     }
     return configuredGenomes().map((genome) => {
       const reference = genome.reference || {};
+      const defaults = IGV_DEFAULT_REFERENCES[genome.name] || {};
+      const useDefaultSequence = !hasConfiguredSequenceReference(reference) &&
+        Boolean(defaults.fastaURL || defaults.twoBitURL);
       const definition = {
         id: genome.name,
         name: genome.label || genome.name,
       };
-      if (reference.fasta) definition.fastaURL = toIgvUrl(reference.fasta);
-      if (reference.fasta_index) definition.indexURL = toIgvUrl(reference.fasta_index);
-      if (reference.compressed_fasta_index) definition.compressedIndexURL = toIgvUrl(reference.compressed_fasta_index);
-      if (reference.twobit) definition.twoBitURL = toIgvUrl(reference.twobit);
-      if (reference.cytoband) definition.cytobandURL = toIgvUrl(reference.cytoband);
-      if (reference.alias) definition.aliasURL = toIgvUrl(reference.alias);
+      if (reference.fasta) {
+        definition.fastaURL = toIgvUrl(reference.fasta);
+        if (reference.fasta_index) definition.indexURL = toIgvUrl(reference.fasta_index);
+        if (reference.compressed_fasta_index) {
+          definition.compressedIndexURL = toIgvUrl(reference.compressed_fasta_index);
+        }
+      } else if (useDefaultSequence && defaults.fastaURL) {
+        definition.fastaURL = defaults.fastaURL;
+        if (defaults.indexURL) definition.indexURL = defaults.indexURL;
+        if (defaults.compressedIndexURL) definition.compressedIndexURL = defaults.compressedIndexURL;
+      }
 
-      // With no real sequence reference, fall back to a *sequence-less* genome
-      // built from the chromosome sizes the server already knows. igv.js loads
-      // these via `format: 'chromsizes'` (its ChromSizes sequence returns null
-      // bases, which is fine for a track-only browser). Crucially this needs a
-      // real same-origin URL, not a data: URL — igv.js 3.1.1's ChromSizes
-      // loader reads `this.fastaURL` (undefined) on the data: branch and
-      // crashes, but takes a plain XHR on the http branch. Serving the sizes
-      // from /api/chromsizes keeps genome init fully local (no igv.org fetch).
-      if (!definition.fastaURL && !definition.twoBitURL) {
+      if (reference.twobit) {
+        definition.twoBitURL = toIgvUrl(reference.twobit);
+      } else if (useDefaultSequence && defaults.twoBitURL) {
+        definition.twoBitURL = defaults.twoBitURL;
+      }
+      if (useDefaultSequence && defaults.twoBitBptURL) {
+        definition.twoBitBptURL = defaults.twoBitBptURL;
+      }
+
+      if (reference.cytoband) {
+        definition.cytobandURL = toIgvUrl(reference.cytoband);
+      } else if (defaults.cytobandURL) {
+        definition.cytobandURL = defaults.cytobandURL;
+      } else if (defaults.cytobandBbURL) {
+        definition.cytobandBbURL = defaults.cytobandBbURL;
+      }
+
+      if (reference.alias) {
+        definition.aliasURL = toIgvUrl(reference.alias);
+      } else if (defaults.aliasURL) {
+        definition.aliasURL = defaults.aliasURL;
+      } else if (defaults.chromAliasBbURL) {
+        definition.chromAliasBbURL = defaults.chromAliasBbURL;
+      }
+
+      if (definition.fastaURL || definition.twoBitURL) {
+        definition.chromSizesURL = '/api/chromsizes?genome=' + encodeURIComponent(genome.name);
+        if (defaults.wholeGenomeView != null) definition.wholeGenomeView = defaults.wholeGenomeView;
+      } else {
+        // With no real sequence reference, fall back to a *sequence-less*
+        // genome built from the chromosome sizes the server already knows.
+        // igv.js loads these via `format: 'chromsizes'` (its ChromSizes
+        // sequence returns null bases, which is fine for a track-only
+        // browser). Crucially this needs a real same-origin URL, not a data:
+        // URL — igv.js 3.1.1's ChromSizes loader reads `this.fastaURL`
+        // (undefined) on the data: branch and crashes, but takes a plain XHR
+        // on the http branch. Serving the sizes from /api/chromsizes keeps
+        // custom genome init fully local.
         definition.format = 'chromsizes';
         definition.url = '/api/chromsizes?genome=' + encodeURIComponent(genome.name);
       }
@@ -896,6 +1065,7 @@
           loadDefaultGenomes: false,
           locus: locusToString(genomeConfig && genomeConfig.default_locus) ||
                  firstChromLocus(genomeConfig),
+          tracks: cloneDefaultGeneTracks(genomeName),
           showNavigation: true,
           showRuler: true,
           showCenterGuide: true,
