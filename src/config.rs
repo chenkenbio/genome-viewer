@@ -63,6 +63,9 @@ pub enum TrackKind {
     BigBed,
     BigWig,
     Gtf,
+    /// seedat `BigWigH5` base-resolution signal: one 1-D dataset per chromosome,
+    /// one value per base pair. Queried on demand like BigWig.
+    Hdf5,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

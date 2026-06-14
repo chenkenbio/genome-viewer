@@ -1,5 +1,6 @@
 /target
 CLAUDE.md
+AGENTS.md
 kas-seq-config.json
 examples/*.bw
 .codex

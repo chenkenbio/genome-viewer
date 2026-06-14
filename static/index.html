@@ -502,7 +502,7 @@
 
   // Build tag, visible in the navbar — proves which version of the SPA the
   // browser actually loaded (cache-busting check).
-  const BUILD_TAG = 'gv-build-2026-05-04-bedgz-fix-r5-genomelist-fix';
+  const BUILD_TAG = 'gv-build-2026-06-13-hdf5-resolution-v2';
   console.log('[genome_viewer] build:', BUILD_TAG);
   document.addEventListener('DOMContentLoaded', () => {
     const nav = document.querySelector('.navbar-igv') || document.body;
@@ -703,6 +703,21 @@
     return locus.chrom + ':' + start + '-' + end;
   }
 
+  // Sequence-less (chromsizes) genomes open in whole-genome view, which makes
+  // igv.js query the synthetic `all` contig and shows no per-base signal. When
+  // a genome has no configured default_locus, open on the first chromosome's
+  // first megabase so tracks render immediately and `all` is never requested.
+  function firstChromLocus(genomeConfig) {
+    const sizes = (genomeConfig && genomeConfig.chrom_sizes) ||
+      (serverConfig && serverConfig.chrom_sizes) || {};
+    const names = Object.keys(sizes);
+    if (names.length === 0) return null;
+    const pick = names.find((n) => n === 'chr1' || n === '1') || names[0];
+    const size = Number(sizes[pick]) || 0;
+    const end = size > 0 ? Math.min(size, 1000000) : 1000000;
+    return pick + ':1-' + end;
+  }
+
   function buildGenomeList() {
     if (!(serverConfig && Array.isArray(serverConfig.genomes) && serverConfig.genomes.length > 0)) {
       return [];
@@ -719,18 +734,20 @@
       if (reference.twobit) definition.twoBitURL = toIgvUrl(reference.twobit);
       if (reference.cytoband) definition.cytobandURL = toIgvUrl(reference.cytoband);
       if (reference.alias) definition.aliasURL = toIgvUrl(reference.alias);
+
+      // With no real sequence reference, fall back to a *sequence-less* genome
+      // built from the chromosome sizes the server already knows. igv.js loads
+      // these via `format: 'chromsizes'` (its ChromSizes sequence returns null
+      // bases, which is fine for a track-only browser). Crucially this needs a
+      // real same-origin URL, not a data: URL — igv.js 3.1.1's ChromSizes
+      // loader reads `this.fastaURL` (undefined) on the data: branch and
+      // crashes, but takes a plain XHR on the http branch. Serving the sizes
+      // from /api/chromsizes keeps genome init fully local (no igv.org fetch).
+      if (!definition.fastaURL && !definition.twoBitURL) {
+        definition.format = 'chromsizes';
+        definition.url = '/api/chromsizes?genome=' + encodeURIComponent(genome.name);
+      }
       return definition;
-    }).filter((definition) => {
-      // Drop entries that carry only id/name and no actual reference URLs.
-      // Such "empty" entries crash igv.js 3.x's genome-merge with
-      // "Cannot read properties of undefined (reading 'startsWith')" when
-      // it tries to combine them with its built-in genomes.json. If the
-      // user wants to use a stock genome (hg38, hg19, etc.), `genome:` +
-      // `loadDefaultGenomes: true` already covers it without us listing
-      // the genome in genomeList.
-      return definition.fastaURL || definition.twoBitURL ||
-             definition.indexURL || definition.compressedIndexURL ||
-             definition.cytobandURL || definition.aliasURL;
     });
   }
 
@@ -740,6 +757,31 @@
     if (options.reference && options.reference.id) return options.reference.id;
     if (options.reference && options.reference.name) return options.reference.name;
     return null;
+  }
+
+  function isServerSignalQueryUrl(url) {
+    const text = String(url || '');
+    return /\/api\/tracks\/[^/]+\/query\?/i.test(text) && /[?&]bins=/i.test(text);
+  }
+
+  function upgradeServerSignalTrackConfig(track) {
+    if (!track || track.type !== 'wig' || track.sourceType !== 'custom') return;
+    const source = track.source || {};
+    if (!isServerSignalQueryUrl(source.url)) return;
+
+    track.format = 'wig';
+    track.expandQuery = false;
+    track.disableCache = true;
+    track.summarize = false;
+    source.queryable = true;
+    source.parser = parseSignalQueryResponse;
+    track.source = source;
+  }
+
+  function upgradeServerSignalSession(options) {
+    if (!options || !Array.isArray(options.tracks)) return options;
+    for (const track of options.tracks) upgradeServerSignalTrackConfig(track);
+    return options;
   }
 
   function setActiveGenome(genomeName) {
@@ -797,9 +839,9 @@
     // Watchdog: if igv.createBrowser doesn't resolve in 20s, surface a banner
     // so the user knows the genome init is what's hanging (not a track click).
     const watchdog = setTimeout(() => {
-      const msg = 'igv.createBrowser is taking >20s — likely hanging on igv.js ' +
-        'reference data fetch (s3.amazonaws.com/igv.org.genomes). Check the ' +
-        '[debug] panel for the pending request.';
+      const msg = 'igv.createBrowser is taking >20s — likely hanging on a ' +
+        'reference data fetch (genome sequence/index or /api/chromsizes). ' +
+        'Check the [debug] panel for the pending request.';
       console.error('[genome_viewer]', msg);
       showErrorBanner(msg);
     }, 20000);
@@ -830,6 +872,7 @@
   async function createBrowser(genome, sessionOptions) {
     const container = document.getElementById('igv-container');
     container.innerHTML = '';
+    upgradeServerSignalSession(sessionOptions);
 
     const genomeName = activeGenomeIdFromOptions(sessionOptions) || genome || currentGenome;
     const genomeConfig = findGenomeConfig(genomeName);
@@ -837,13 +880,22 @@
       ? {
           ...sessionOptions,
           genomeList: buildGenomeList(),
-          loadDefaultGenomes: true,
+          // false → igv.js will NOT fetch its hosted registry
+          // (igv.org/genomes/genomes.json). Every genome we offer is already in
+          // genomeList (real reference or a /api/chromsizes fallback), so init
+          // stays fully local and survives networks that block igv.org.
+          loadDefaultGenomes: false,
         }
       : {
           genome: genomeName,
           genomeList: buildGenomeList(),
-          loadDefaultGenomes: true,
-          locus: locusToString(genomeConfig && genomeConfig.default_locus),
+          // false → igv.js will NOT fetch its hosted registry
+          // (igv.org/genomes/genomes.json). Every genome we offer is already in
+          // genomeList (real reference or a /api/chromsizes fallback), so init
+          // stays fully local and survives networks that block igv.org.
+          loadDefaultGenomes: false,
+          locus: locusToString(genomeConfig && genomeConfig.default_locus) ||
+                 firstChromLocus(genomeConfig),
           showNavigation: true,
           showRuler: true,
           showCenterGuide: true,
@@ -867,11 +919,14 @@
 
   // ── Track loading helpers ───────────────────────────────────────
 
-  // Plain-gzipped text formats (BED/GTF/etc.) that are *not* bgzip+tabix
-  // indexed. igv.js can't random-access these, so we register them on the
-  // server (which decompresses + parses) and let igv.js query features via
-  // /api/tracks/{id}/query through a custom source.
-  const SERVER_PARSE_RE = /\.(bed|gtf|gff|gff3|bedgraph)(\.gz)?$/i;
+  // Plain-gzipped BED/GTF that is *not* bgzip+tabix indexed. igv.js can neither
+  // decompress plain gzip nor random-access it, so we register these on the
+  // server (which decompresses + parses) and feed igv.js features via
+  // /api/tracks/{id}/query through a custom source. Uncompressed text formats
+  // are NOT matched here — igv.js loads those whole-file directly (no index),
+  // and the server only knows how to parse BED/GTF, so the alternation is
+  // limited to those two.
+  const SERVER_PARSE_RE = /\.(bed|gtf)\.gz$/i;
 
   function inferIndexUrl(filePath) {
     // Last-resort guess only for BAM/CRAM, which by convention always carry
@@ -938,16 +993,79 @@
     };
   }
 
+  /** Parse a /api/tracks/{id}/query signal response into igv.js wig features. */
+  function parseSignalQueryResponse(body) {
+    let data;
+    try {
+      data = (typeof body === 'string') ? JSON.parse(body) : body;
+    } catch (e) {
+      console.error('genome_viewer: failed to parse signal query body', e, body);
+      return [];
+    }
+    const bins = (data && Array.isArray(data.signal)) ? data.signal : [];
+    return bins
+      .filter(b => Number.isFinite(b.value))
+      .map(b => ({ chr: data.chrom, start: b.start, end: b.end, value: b.value }));
+  }
+
+  /** Register a server-side HDF5 signal track and return an igv.js custom wig
+   *  source. HDF5 responses are resolution-dependent bins, so igv.js must query
+   *  exactly the requested viewport instead of expanding/caching like BED. */
+  async function registerServerSignalTrack(entry) {
+    const resp = await apiFetch('/api/tracks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: entry.path, name: entry.name, kind: 'hdf5' }),
+    });
+    if (!resp.ok) {
+      const msg = await resp.text().catch(() => '');
+      throw new Error('register signal track failed (' + resp.status + '): ' + msg);
+    }
+    const reg = await resp.json();
+    const queryUrl = '/api/tracks/' + encodeURIComponent(reg.id) +
+      '/query?chrom=$CHR&start=$START&end=$END&bins=4000&window_function=mean';
+    return {
+      name: entry.name,
+      type: 'wig',
+      format: 'wig',
+      sourceType: 'custom',
+      autoscale: true,
+      color: '#2171b5',
+      // These bins depend on query resolution. `expandQuery: false` prevents
+      // igv.js from turning a small zoomed view into a whole-chromosome request,
+      // `disableCache` avoids reusing bins computed for a different zoom level,
+      // and `summarize: false` prevents a second client-side averaging pass.
+      expandQuery: false,
+      disableCache: true,
+      summarize: false,
+      source: {
+        url: queryUrl,
+        method: 'GET',
+        queryable: true,
+        parser: parseSignalQueryResponse,
+      },
+    };
+  }
+
   /** Build an igv.js track config for a /api/files entry. Async because some
    *  formats (plain-gzipped BED/GTF) need a server-side registration first. */
   async function serverPathToIgvTrack(entry) {
     const lowerName = (entry.name || entry.path || '').toLowerCase();
+
+    // HDF5 signal (seedat BigWigH5) has no igv.js-native format — register it
+    // server-side and feed it in as a custom wig source. Must come before the
+    // text-track branch and the raw /api/data fallback (neither can serve HDF5).
+    if (/\.(h5|hdf5)$/i.test(lowerName)) {
+      return await registerServerSignalTrack(entry);
+    }
+
     // Server-confirmed index path takes precedence over guesses.
     const indexPath = entry.index_path || inferIndexUrl(entry.path);
 
-    // For text feature formats with no Tabix index, parse server-side. This
-    // covers `peaks.bed`, `peaks.bed.gz`, `genes.gtf.gz`, etc. — including
-    // plain (non-bgzip) gzip, which igv.js can't decompress on its own.
+    // Plain-gzipped BED/GTF with no Tabix index can't be decompressed by
+    // igv.js, so parse them server-side (`peaks.bed.gz`, `genes.gtf.gz`).
+    // Uncompressed BED/GTF and every other format fall through to the direct
+    // /api/data URL below, where igv.js loads them using `entry.format`.
     if (!indexPath && SERVER_PARSE_RE.test(lowerName)) {
       try {
         return await registerServerTextTrack(entry);
@@ -983,10 +1101,15 @@
     const colors = {
       bam: 'bg-primary', cram: 'bg-primary',
       vcf: 'bg-danger',
-      bigwig: 'bg-success', wig: 'bg-success', bedgraph: 'bg-success',
-      bigbed: 'bg-warning text-dark',
+      bigwig: 'bg-success', wig: 'bg-success', bedgraph: 'bg-success', tdf: 'bg-success', hdf5: 'bg-success',
+      bigbed: 'bg-warning text-dark', bedpe: 'bg-warning text-dark', interact: 'bg-warning text-dark',
       bed: 'bg-info text-dark',
+      narrowpeak: 'bg-info text-dark', broadpeak: 'bg-info text-dark',
+      gappedpeak: 'bg-info text-dark', regionpeak: 'bg-info text-dark',
+      bedmethyl: 'bg-info text-dark',
       gtf: 'bg-secondary', gff: 'bg-secondary', gff3: 'bg-secondary',
+      refgene: 'bg-secondary', genepred: 'bg-secondary', genepredext: 'bg-secondary', refflat: 'bg-secondary',
+      gwas: 'bg-danger', maf: 'bg-danger', mut: 'bg-danger',
       seg: 'bg-dark',
     };
     return colors[format] || 'bg-secondary';
@@ -1055,10 +1178,14 @@
 
         const metaSpan = document.createElement('span');
         metaSpan.className = 'file-entry-meta';
-        if (entry.format) {
+        // HDF5 signal files have no igv.js-native format, so derive a display
+        // label from the extension so they still get a (green) signal badge.
+        const displayFormat = entry.format ||
+          (/\.(h5|hdf5)$/i.test(entry.name) ? 'hdf5' : null);
+        if (displayFormat) {
           const badge = document.createElement('span');
-          badge.className = 'badge badge-format ' + formatBadgeColor(entry.format);
-          badge.textContent = entry.format;
+          badge.className = 'badge badge-format ' + formatBadgeColor(displayFormat);
+          badge.textContent = displayFormat;
           metaSpan.appendChild(badge);
         }
         if (!entry.is_dir && entry.size != null) {
@@ -1204,6 +1331,7 @@
       try {
         const text = await file.text();
         const session = JSON.parse(text);
+        upgradeServerSignalSession(session);
         const container = document.getElementById('igv-container');
         container.innerHTML = '';
         browser = await igv.createBrowser(container, session);
@@ -1410,7 +1538,7 @@
       // Track rendering — skip if no data available
       if (!data) {
         // no-op: track had no data or failed to fetch
-      } else if (t.kind === 'bigwig' && data.signal) {
+      } else if ((t.kind === 'bigwig' || t.kind === 'hdf5') && data.signal) {
         svg += renderSignalTrack(data.signal, t, ml, yOff, plotW, h, scaleX, start, end, font, fs);
       } else if ((t.kind === 'bed' || t.kind === 'bigbed') && data.features) {
         svg += renderFeatureTrack(t._featureRows || [], t, ml, yOff, plotW, h, scaleX, start, end, font, fs);
@@ -2112,7 +2240,7 @@
             start: String(cfg.region.start),
             end: String(cfg.region.end),
           });
-          if (t.kind === 'bigwig') {
+          if (t.kind === 'bigwig' || t.kind === 'hdf5') {
             params.set('bins', String(bins));
             params.set('window_function', 'mean');
           } else {

@@ -27,8 +27,8 @@ use crate::model::{
     WindowFunction,
 };
 use crate::tracks::{
-    TextTrack, build_text_tracks, igvjs_format, infer_track_kind, is_genomic_file, load_text_track,
-    query_bigbed, query_bigwig, query_text_track,
+    BadRequest, TextTrack, build_text_tracks, igvjs_format, infer_track_kind, is_genomic_file,
+    load_text_track, query_bigbed, query_bigwig, query_hdf5, query_text_track,
 };
 
 #[derive(Debug, Parser)]
@@ -358,6 +358,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/api/auth", post(auth_handler))
         .route("/api/config", get(get_config))
+        .route("/api/chromsizes", get(chrom_sizes))
         .route("/api/data", get(serve_data))
         .route("/api/files", get(list_files))
         .route("/api/tracks", post(add_track))
@@ -413,7 +414,11 @@ async fn get_config(State(state): State<AppState>) -> Json<ApiConfigResponse> {
             supports_track_add: !state.allowed_roots.is_empty(),
         },
         tracks,
-        todos: vec!["HDF5-backed tracks are planned but not implemented yet.".to_string()],
+        todos: vec![
+            "HDF5 signal tracks support base-resolution BigWigH5 only; the binned \
+             LowResBigWigH5 layout is not supported yet."
+                .to_string(),
+        ],
     })
 }
 
@@ -436,6 +441,46 @@ fn api_genome_response(genome: &crate::config::ResolvedGenomeConfig) -> ApiGenom
             alias: genome.raw.reference.alias.clone(),
         },
     }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ChromSizesQuery {
+    genome: Option<String>,
+}
+
+/// Serve a genome's chromosome sizes as a UCSC-style `chrom.sizes` text file
+/// (`<name>\t<size>` per line). This lets the frontend build a sequence-less
+/// igv.js genome (`format: "chromsizes"`) entirely from local data, so the
+/// browser never has to fetch igv.js's hosted genome registry from igv.org —
+/// which fails on networks that can reach this server but not igv.org.
+async fn chrom_sizes(
+    State(state): State<AppState>,
+    Query(query): Query<ChromSizesQuery>,
+) -> Result<Response, AppError> {
+    let sizes = match query.genome.as_deref() {
+        Some(name) => state
+            .config
+            .genomes
+            .iter()
+            .find(|genome| genome.raw.name == name)
+            .map(|genome| &genome.chrom_sizes)
+            .ok_or_else(|| AppError::not_found(format!("unknown genome '{}'", name)))?,
+        None => &state.config.chrom_sizes,
+    };
+
+    let mut body = String::with_capacity(sizes.len() * 16);
+    for (chrom, size) in sizes {
+        body.push_str(chrom);
+        body.push('\t');
+        body.push_str(&size.to_string());
+        body.push('\n');
+    }
+
+    Ok((
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        body,
+    )
+        .into_response())
 }
 
 async fn list_files(
@@ -710,6 +755,25 @@ async fn query_track(
         .cloned()
         .ok_or_else(|| AppError::not_found(format!("unknown track '{}'", track_id)))?;
 
+    // igv.js requests the synthetic whole-genome contig `all` in its fully
+    // zoomed-out view. Server-side tracks are queried per real chromosome and
+    // can't aggregate across the whole genome, so return an empty result (200)
+    // rather than a 400 — igv renders nothing at genome scale and queries real
+    // data once the user zooms into a chromosome.
+    if query.chrom.eq_ignore_ascii_case("all") {
+        let is_signal = matches!(track.kind, TrackKind::BigWig | TrackKind::Hdf5);
+        return Ok(Json(TrackResponse {
+            track_id,
+            kind: track.kind,
+            chrom: query.chrom,
+            start: query.start,
+            end: query.end,
+            window_function: is_signal.then(|| query.window_function.unwrap_or_default()),
+            signal: is_signal.then(Vec::new),
+            features: (!is_signal).then(Vec::new),
+        }));
+    }
+
     let chrom = query.chrom.clone();
     let start = query.start;
     let end = query.end;
@@ -736,6 +800,28 @@ async fn query_track(
             .await
             .map_err(join_error)?
             .map_err(AppError::from)?
+        }
+        TrackKind::Hdf5 => {
+            let source = track.source.clone();
+            let bins = query.bins.unwrap_or(800);
+            let window_function = query.window_function.unwrap_or_default();
+            tokio::task::spawn_blocking(move || {
+                query_hdf5(&source, &chrom, start, end, bins, window_function).map(|signal| {
+                    TrackResponse {
+                        track_id,
+                        kind: TrackKind::Hdf5,
+                        chrom,
+                        start,
+                        end,
+                        window_function: Some(window_function),
+                        signal: Some(signal),
+                        features: None,
+                    }
+                })
+            })
+            .await
+            .map_err(join_error)?
+            .map_err(map_query_error)?
         }
         TrackKind::BigBed => {
             let source = track.source.clone();
@@ -791,6 +877,18 @@ fn validate_query(query: &TrackQuery) -> Result<(), AppError> {
 
 fn join_error(error: tokio::task::JoinError) -> AppError {
     AppError::from(anyhow!("background task failed: {}", error))
+}
+
+/// Map a track-query error to an HTTP status. User/data-caused conditions are
+/// carried as a [`BadRequest`] inside the `anyhow` error (e.g. an HDF5 file in
+/// an unsupported layout, a remote HDF5 URL, a missing chromosome) and become
+/// `400 Bad Request` so the explanation reaches the client; anything else stays
+/// a generic `500` (real detail logged server-side).
+fn map_query_error(error: anyhow::Error) -> AppError {
+    match error.downcast_ref::<BadRequest>() {
+        Some(bad) => AppError::bad_request(bad.0.clone()),
+        None => AppError::from(error),
+    }
 }
 
 fn lock_error<T>(_: std::sync::PoisonError<T>) -> AppError {
