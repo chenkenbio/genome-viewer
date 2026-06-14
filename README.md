@@ -51,6 +51,7 @@ genome_viewer --port 52000-53000
 genome_viewer --token MY_SECRET
 genome_viewer --refresh-token
 genome_viewer --no-token
+genome_viewer --allow-symlink
 ```
 
 Default behavior:
@@ -91,6 +92,7 @@ That config demonstrates:
 | `--refresh-token` | Generate a new token and save it to `~/.config/genome_viewer/config.yaml`. |
 | `--root <path>` | Add an allowed local root. Repeatable. |
 | `--no-cwd` | Do not add the current directory to allowed roots. |
+| `--allow-symlink` | Allow symlinks located inside allowed roots to target files outside allowed roots. |
 | `--title <text>` | Viewer title. |
 
 ## Configuration
@@ -289,6 +291,8 @@ Local file access is restricted:
 - local paths must resolve inside canonicalized `allowed_roots`
 - symlink traversal outside those roots is blocked by canonicalization before validation
 - if there are no allowed roots, UI-based local file loading is disabled
+
+If your browsed project tree contains symlinks to data stored elsewhere, launch with `--allow-symlink`. With that flag, the requested path must still be inside an allowed root, but the symlink target may resolve outside those roots. Leave it off for stricter containment.
 
 Remote `http://` and `https://` track sources are allowed and bypass local path checks, but they are read-only sources.
 

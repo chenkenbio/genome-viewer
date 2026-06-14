@@ -79,6 +79,10 @@ struct Args {
     #[arg(long)]
     no_cwd: bool,
 
+    /// Allow symlinks inside allowed roots to target files outside allowed roots.
+    #[arg(long)]
+    allow_symlink: bool,
+
     /// Title for the viewer.
     #[arg(long)]
     title: Option<String>,
@@ -91,6 +95,7 @@ struct AppState {
     track_order: Arc<RwLock<Vec<String>>>,
     text_tracks: Arc<RwLock<std::collections::HashMap<String, TextTrack>>>,
     allowed_roots: Arc<Vec<PathBuf>>,
+    allow_symlink: bool,
     token: Option<String>,
 }
 
@@ -331,6 +336,7 @@ async fn main() -> Result<()> {
         genome = %config.raw.genome.name,
         tracks = config.raw.tracks.len(),
         roots = allowed_roots.len(),
+        allow_symlink = args.allow_symlink,
         "loaded configuration"
     );
     for root in allowed_roots.iter() {
@@ -352,6 +358,7 @@ async fn main() -> Result<()> {
         track_order,
         text_tracks,
         allowed_roots,
+        allow_symlink: args.allow_symlink,
         token,
     };
 
@@ -1011,17 +1018,39 @@ fn random_index(upper_bound: usize) -> Result<usize> {
 }
 
 fn validate_local_source(state: &AppState, source: &str) -> Result<PathBuf, AppError> {
+    validate_local_path(source, &state.allowed_roots, state.allow_symlink)
+}
+
+fn validate_local_path(
+    source: &str,
+    allowed_roots: &[PathBuf],
+    allow_symlink: bool,
+) -> Result<PathBuf, AppError> {
     let path = normalize_local_path(source).map_err(AppError::from)?;
-    if state.allowed_roots.is_empty() {
+    if allowed_roots.is_empty() {
         return Err(AppError::bad_request(
             "UI loading of server files is disabled because no allowed_roots are configured",
         ));
     }
+
+    if allow_symlink {
+        if !is_within_allowed_roots(allowed_roots, &path) {
+            return Err(AppError::bad_request(format!(
+                "path '{}' is outside allowed roots",
+                path.display()
+            )));
+        }
+        std::fs::metadata(&path).map_err(|e| {
+            AppError::bad_request(format!("cannot resolve path '{}': {}", path.display(), e))
+        })?;
+        return Ok(path);
+    }
+
     // Canonicalize to resolve symlinks — prevents symlink traversal outside allowed roots
     let canonical = std::fs::canonicalize(&path).map_err(|e| {
         AppError::bad_request(format!("cannot resolve path '{}': {}", path.display(), e))
     })?;
-    if !is_within_allowed_roots(&state.allowed_roots, &canonical) {
+    if !is_within_allowed_roots(allowed_roots, &canonical) {
         return Err(AppError::bad_request(format!(
             "path '{}' is outside allowed roots",
             path.display()
@@ -1357,8 +1386,9 @@ const LOGIN_PAGE_ERROR: &str = r#"<!doctype html>
 mod tests {
     use super::{
         PortSelection, find_sibling_index, is_truthy, is_within_allowed_roots, parse_port_spec,
-        resolve_port_selection, slugify,
+        resolve_port_selection, slugify, validate_local_path,
     };
+    use axum::http::StatusCode;
     use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
     use std::str::FromStr;
@@ -1379,6 +1409,30 @@ mod tests {
             &roots,
             Path::new("/data/other/a.bed")
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_targets_outside_roots_require_opt_in() {
+        let allowed_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let target = outside_dir.path().join("target.bam");
+        std::fs::write(&target, b"BAM").unwrap();
+
+        let link = allowed_dir.path().join("linked.bam");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let roots = vec![std::fs::canonicalize(allowed_dir.path()).unwrap()];
+        let err = validate_local_path(link.to_str().unwrap(), &roots, false).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("outside allowed roots"));
+
+        let accepted = validate_local_path(link.to_str().unwrap(), &roots, true).unwrap();
+        assert_eq!(accepted, link);
+        assert_eq!(
+            std::fs::canonicalize(&accepted).unwrap(),
+            std::fs::canonicalize(&target).unwrap()
+        );
     }
 
     #[test]
